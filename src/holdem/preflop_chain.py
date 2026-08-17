@@ -52,7 +52,7 @@ from .preflop_tree import SubgameConfig
 from .ranges import NUM_HAND_CLASSES, Range
 from .realization import RealizationModel
 
-__all__ = ["TableConfig", "OpenSpot", "TableSolution", "solve_table"]
+__all__ = ["TableConfig", "OpenSpot", "TableSolution", "solve_table", "defender_advantage"]
 
 _CLASSES = range(NUM_HAND_CLASSES)
 
@@ -245,6 +245,26 @@ def solve_table(
                 )
 
     return TableSolution(config=cfg, spots=spots, sweeps=sweeps, max_change=max_change)
+
+
+def defender_advantage(solution: PreflopSolution) -> tuple[float, ...]:
+    """防守者「继续」比「弃牌」每手好多少（大盲/手），逐牌类。
+
+    风格层放宽范围时要有个顺序：先纳进来的应该是**最接近该打**的牌。这个顺序不该靠
+    「权益高低」之类的外部猜测——求解器本来就算出了每手牌两条路的价值，差值就是答案。
+    """
+    root = solution.tree.root
+    fold_index = next(
+        (i for i, action in enumerate(root.actions) if action.kind == "fold"), None
+    )
+    if fold_index is None:
+        return (0.0,) * NUM_HAND_CLASSES
+    fold_ev = solution.root_branches[fold_index].hand_ev(0)
+    others = [b for b in solution.root_branches if b.action != fold_index]
+    if not others:
+        return (0.0,) * NUM_HAND_CLASSES
+    continue_ev = combine(others, player=0)
+    return tuple(continue_ev[i] - fold_ev[i] for i in _CLASSES)
 
 
 def _facing_open(config: TableConfig, opener: int, defender: int) -> SubgameConfig:

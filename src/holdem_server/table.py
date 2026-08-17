@@ -13,7 +13,7 @@ import random
 from dataclasses import dataclass, field
 
 from holdem.actions import Action, ActionKind, bet, call, check, fold, raise_to
-from holdem.bots import DEFAULT_STYLE, STYLES, RuleBot
+from holdem.bots import DEFAULT_STYLE, STYLES, Bot
 from holdem.cards import card_to_str
 from holdem.deck import shuffled_deck
 from holdem.positions import position_of
@@ -80,7 +80,7 @@ class TableSession:
         self.button = n - 1  # 第一手开始前先移动按钮，于是首手按钮落在座位 0
         self._rng = random.Random(self.config.seed)
         self._bots = {
-            seat: RuleBot(cfg.style, seed=self._rng.randrange(1 << 30))
+            seat: Bot(cfg.style, seed=self._rng.randrange(1 << 30))
             for seat, cfg in enumerate(self.config.seats)
             if not cfg.is_human
         }

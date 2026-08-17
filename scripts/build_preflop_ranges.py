@@ -26,7 +26,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from holdem.preflop_chain import TableConfig, TableSolution, solve_table  # noqa: E402
+from holdem.preflop_chain import (  # noqa: E402
+    TableConfig,
+    TableSolution,
+    defender_advantage,
+    solve_table,
+)
 from holdem.realization import RealizationModel  # noqa: E402
 
 FORMAT = "PFRANGE1"
@@ -51,6 +56,8 @@ def build_document(solution: TableSolution, model: RealizationModel, seconds: fl
                     for index, action in enumerate(root.actions)
                 },
                 "exploitability": round(sub.exploitability, 6),
+                # 逐牌类的「继续比弃牌好多少」，风格层放宽范围时按它排序
+                "advantage": [round(v, 5) for v in defender_advantage(sub)],
             }
             # 开牌者面对 3bet 的应对：根节点第一个加注分支之下就是他的决策
             for index, action in enumerate(root.actions):
@@ -74,6 +81,9 @@ def build_document(solution: TableSolution, model: RealizationModel, seconds: fl
         spots[spot.name] = {
             "open": spot.open_range.to_text(),
             "open_frequency": round(spot.open_frequency, 4),
+            # 逐牌类的开牌 EV：风格层放宽开牌范围时按它排序
+            "open_ev": [round(v, 5) for v in spot.open_hand_ev],
+            "fold_value": round(spot.fold_value, 5),
             "defenses": defenses,
         }
 

@@ -56,6 +56,8 @@ class DefenseEntry:
     frequencies: dict[str, float]
     """动作标签 → 频率（按组合数加权，且只统计走得到这里的牌）。"""
     exploitability: float
+    advantage: tuple[float, ...] | None = None
+    """逐牌类的「继续比弃牌好多少」（大盲/手），风格层放宽范围时的排序依据。"""
     reraise_reply: dict[str, Range] | None = None
     """开牌者面对这个防守者再加注时的应对；没有再加注分支时是 None。"""
     reraise_reply_frequencies: dict[str, float] | None = None
@@ -89,6 +91,8 @@ class PreflopRangeTable:
     max_change: float
     opens: dict[str, Range]
     open_frequencies: dict[str, float]
+    open_ev: dict[str, tuple[float, ...]]
+    """逐牌类的开牌 EV（大盲/手）。老版本的表里没有这一项时是空的。"""
     defenses: dict[tuple[str, str], DefenseEntry]
 
     @property
@@ -136,10 +140,13 @@ def _load(path_text: str) -> PreflopRangeTable:
 
     opens: dict[str, Range] = {}
     frequencies: dict[str, float] = {}
+    open_ev: dict[str, tuple[float, ...]] = {}
     defenses: dict[tuple[str, str], DefenseEntry] = {}
     for opener, spot in document["spots"].items():
         opens[opener] = Range.parse(spot["open"])
         frequencies[opener] = float(spot["open_frequency"])
+        if spot.get("open_ev"):
+            open_ev[opener] = tuple(spot["open_ev"])
         for defender, entry in spot["defenses"].items():
             reply = entry.get("vs_reraise")
             defenses[(opener, defender)] = DefenseEntry(
@@ -152,6 +159,7 @@ def _load(path_text: str) -> PreflopRangeTable:
                     label: float(value) for label, value in entry["frequencies"].items()
                 },
                 exploitability=float(entry["exploitability"]),
+                advantage=tuple(entry["advantage"]) if entry.get("advantage") else None,
                 reraise_reply=(
                     {label: Range.parse(text) for label, text in reply["actions"].items()}
                     if reply
@@ -172,5 +180,6 @@ def _load(path_text: str) -> PreflopRangeTable:
         max_change=float(document["max_change"]),
         opens=opens,
         open_frequencies=frequencies,
+        open_ev=open_ev,
         defenses=defenses,
     )

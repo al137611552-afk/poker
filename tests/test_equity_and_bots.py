@@ -8,7 +8,7 @@ import random
 import pytest
 
 from holdem.actions import ActionKind
-from holdem.bots import STYLES, RuleBot, play_out
+from holdem.bots import STYLES, Bot, play_out
 from holdem.cards import cards_from_str
 from holdem.deck import deck_from_seed
 from holdem.equity import monte_carlo_equity
@@ -75,7 +75,7 @@ def _table(num_seats, style="tag", seed=1, stacks=1000):
         stacks=(stacks,) * num_seats, button=0, big_blind=10, small_blind=5
     )
     hand = HandState(config, deck_from_seed(seed))
-    bots = {seat: RuleBot(style, seed=seed * 100 + seat) for seat in range(num_seats)}
+    bots = {seat: Bot(style, seed=seed * 100 + seat) for seat in range(num_seats)}
     return hand, bots
 
 
@@ -102,14 +102,14 @@ def test_bots_handle_short_stacks():
     config = HandConfig(stacks=(12, 1000, 35, 7), button=0, big_blind=10, small_blind=5)
     for seed in range(20):
         hand = HandState(config, deck_from_seed(seed))
-        bots = {seat: RuleBot("lag", seed=seed + seat) for seat in range(4)}
+        bots = {seat: Bot("lag", seed=seed + seat) for seat in range(4)}
         play_out(hand, bots)
         assert sum(hand.stacks) == 12 + 1000 + 35 + 7
 
 
 def test_unknown_style_is_rejected():
     with pytest.raises(ValueError, match="未知风格"):
-        RuleBot("超级高手")
+        Bot("超级高手")
 
 
 def test_styles_differ_in_looseness():
@@ -120,7 +120,7 @@ def test_styles_differ_in_looseness():
         total = 0
         for seed in range(60):
             hand, _ = _table(6, seed=seed)
-            bots = {seat: RuleBot(style, seed=seed * 10 + seat) for seat in range(6)}
+            bots = {seat: Bot(style, seed=seed * 10 + seat) for seat in range(6)}
             # 只看枪口位第一个决策
             action = bots[hand.to_act].act(hand)
             total += 1
@@ -142,7 +142,7 @@ def _preflop_stats(style, hands=120):
             stacks=(1000,) * 6, button=index % 6, big_blind=10, small_blind=5
         )
         hand = HandState(config, deck_from_seed(rng.randrange(1 << 30)))
-        bots = {s: RuleBot(style, seed=rng.randrange(1 << 30)) for s in range(6)}
+        bots = {s: Bot(style, seed=rng.randrange(1 << 30)) for s in range(6)}
         play_out(hand, bots)
         seen = set()
         for record in action_records(hand):
