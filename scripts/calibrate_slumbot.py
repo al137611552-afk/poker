@@ -275,11 +275,18 @@ def report(path: Path) -> None:
 # ------------------------------------------------------------------ 对照
 
 
-def _predict(model, *, stack_bb: float, open_to_bb: float, iterations: int) -> dict:
-    """用我们的模型解一局单挑，取出与 Slumbot 三个格子对应的频率。"""
+def _on_path() -> None:
+    """采集不需要 holdem 包，只有对照才需要——用到时才把 src 挂上去。"""
     import sys
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    source = str(Path(__file__).resolve().parent.parent / "src")
+    if source not in sys.path:
+        sys.path.insert(0, source)
+
+
+def _predict(model, *, stack_bb: float, open_to_bb: float, iterations: int) -> dict:
+    """用我们的模型解一局单挑，取出与 Slumbot 三个格子对应的频率。"""
+    _on_path()
     from holdem.preflop_solver import solve_preflop
     from holdem.preflop_tree import PreflopConfig
 
@@ -315,6 +322,7 @@ def compare(path: Path, iterations: int, min_samples: int = 100) -> None:
 
     **不自动改默认值**：参数怎么定是有后果的决定，这里只给出对照与建议。
     """
+    _on_path()
     from holdem.realization import RealizationModel
 
     document = json.loads(path.read_text(encoding="utf-8"))
