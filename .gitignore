@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+*.sqlite
+*.db
+/data/            # 只忽略仓库根的运行时数据；src/holdem/data 是随包分发的预计算表，必须提交
+.DS_Store

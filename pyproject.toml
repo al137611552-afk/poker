@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holdem-trainer"
+version = "0.1.0"
+description = "德扑训练台——本地运行的德州扑克训练与复盘系统"
+requires-python = ">=3.11"
+# 引擎核心（holdem 包）刻意保持零依赖——它要能被任何环境直接引用
+dependencies = []
+
+[project.optional-dependencies]
+server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",      # FastAPI TestClient
+    "pokerkit>=0.5",    # 仅用于牌谱格式的外部互认测试
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# 预计算的翻前权益表（约 112 KB），随包分发；由 scripts/build_preflop_equity.py 生成
+holdem = ["data/*.bin"]
+holdem_server = ["static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# 默认跳过慢测（翻前全枚举，每个对局约 16 秒）；用 `-m slow` 单独跑
+addopts = "-q -m 'not slow'"
+markers = ["slow: 需要数十秒的全枚举验证，默认不跑"]

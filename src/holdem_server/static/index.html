@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1512">
+<title>德扑训练台</title>
+<style>
+  :root {
+    --bg: #0f1512;
+    --felt: #16342a;
+    --felt-edge: #0c1f18;
+    --surface: #182019;
+    --surface-2: #1f2a22;
+    --line: #2b3a30;
+    --ink: #e8ece4;
+    --muted: #97a394;
+    --accent: #6fb394;
+    --warn: #d2ac5c;
+    --danger: #e0707a;
+    --red: #e0707a;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+            "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink); font-family: var(--sans);
+    font-size: 15px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: .4; }
+
+  .wrap { max-width: 860px; margin: 0 auto; padding: 12px 12px 140px; }
+
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 4px 2px 14px; border-bottom: 1px solid var(--line); margin-bottom: 16px;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .02em; }
+  header .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  header .spacer { flex: 1; }
+  .link-btn {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 4px; padding: 4px 10px; font-size: 12.5px;
+  }
+  .link-btn:hover { color: var(--ink); border-color: var(--accent); }
+
+  /* ---------- 设置面板 ---------- */
+  .panel {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; color: var(--muted); }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+  .field label {
+    display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px;
+    letter-spacing: .04em;
+  }
+  .field input, .field select {
+    width: 100%; background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 4px; padding: 7px 9px; font-family: var(--mono); font-size: 13px;
+  }
+  .field input:focus, .field select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .seat-styles { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .seat-style { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .seat-style span { color: var(--muted); font-family: var(--mono); font-size: 12px; min-width: 48px; }
+  .seat-style select { flex: 1; background: var(--surface-2); border: 1px solid var(--line);
+                       border-radius: 4px; padding: 5px 7px; font-size: 12.5px; }
+
+  .primary {
+    background: var(--accent); color: #0b1410; border: none; border-radius: 5px;
+    padding: 10px 18px; font-weight: 600; font-size: 14px;
+  }
+  .primary:hover:not(:disabled) { filter: brightness(1.08); }
+
+  /* ---------- 牌桌 ---------- */
+  .felt {
+    background: radial-gradient(ellipse at 50% 42%, var(--felt) 0%, var(--felt-edge) 100%);
+    border: 1px solid var(--line); border-radius: 12px; padding: 16px 14px;
+    margin-bottom: 14px;
+  }
+  .seats { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 8px; }
+  .seat {
+    background: rgba(9, 16, 12, .55); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; position: relative; transition: border-color .15s, box-shadow .15s;
+  }
+  .seat.acting { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .seat.folded { opacity: .38; }
+  .seat.hero { border-color: var(--warn); }
+  .seat-top { display: flex; align-items: baseline; gap: 6px; }
+  .seat-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .seat-pos { font-family: var(--mono); font-size: 10px; color: var(--accent); letter-spacing: .06em; }
+  .seat-style-tag { font-size: 10.5px; color: var(--muted); margin-left: auto; }
+  .seat-stack { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .seat-bet {
+    font-family: var(--mono); font-size: 11.5px; color: var(--warn); margin-top: 3px;
+    min-height: 17px;
+  }
+  .seat-cards { display: flex; gap: 3px; margin-top: 6px; }
+  .badge {
+    position: absolute; top: -7px; right: -7px; background: var(--warn); color: #0b1410;
+    font-family: var(--mono); font-size: 9.5px; font-weight: 700; border-radius: 999px;
+    padding: 1px 6px; letter-spacing: .04em;
+  }
+
+  .card {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 26px; height: 34px; padding: 0 4px; border-radius: 3px;
+    background: #f2f4ef; color: #14181a; font-family: var(--mono);
+    font-size: 14px; font-weight: 700; letter-spacing: -.02em;
+  }
+  .card.red { color: #b3303c; }
+  .card.back {
+    background: repeating-linear-gradient(45deg, #24382e 0 4px, #1b2b23 4px 8px);
+    color: transparent; border: 1px solid var(--line);
+  }
+  .card.small { min-width: 21px; height: 28px; font-size: 12px; }
+
+  .middle { text-align: center; padding: 18px 0 10px; }
+  .board { display: flex; gap: 5px; justify-content: center; min-height: 34px; }
+  .pot { font-family: var(--mono); font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .pot b { color: var(--ink); font-size: 15px; }
+  .street-tag {
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    letter-spacing: .1em; text-transform: uppercase;
+  }
+
+  /* ---------- 日志 ---------- */
+  .log {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px 12px; max-height: 168px; overflow-y: auto; font-size: 12.5px;
+    color: var(--muted); font-family: var(--mono);
+  }
+  .log div { padding: 1px 0; }
+  .log .street { color: var(--accent); }
+
+  /* ---------- 操作栏 ---------- */
+  .actionbar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    background: rgba(15, 21, 18, .96); border-top: 1px solid var(--line);
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+    backdrop-filter: blur(8px);
+  }
+  .actionbar .inner { max-width: 860px; margin: 0 auto; }
+  .buttons { display: flex; gap: 8px; }
+  .buttons button {
+    flex: 1; padding: 13px 6px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--surface-2); font-weight: 600; font-size: 14px; min-height: 48px;
+  }
+  .buttons button.fold:not(:disabled) { border-color: rgba(224,112,122,.5); color: var(--danger); }
+  .buttons button.raise:not(:disabled) { background: var(--accent); color: #0b1410; border-color: var(--accent); }
+  .buttons button:hover:not(:disabled) { filter: brightness(1.12); }
+  .sizing { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .sizing input[type=range] { flex: 1; accent-color: var(--accent); }
+  .sizing .amount {
+    font-family: var(--mono); font-size: 14px; min-width: 62px; text-align: right; color: var(--warn);
+  }
+  .quick { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+  .quick button {
+    border: 1px solid var(--line); background: none; color: var(--muted);
+    border-radius: 999px; padding: 4px 11px; font-size: 12px; font-family: var(--mono);
+  }
+  .quick button:hover { color: var(--ink); border-color: var(--accent); }
+  .waiting { text-align: center; color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .result {
+    text-align: center; font-size: 13.5px; padding: 4px 0 10px;
+  }
+  .result .win { color: var(--accent); font-weight: 600; }
+  .result .lose { color: var(--danger); }
+  .hidden { display: none !important; }
+  .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>德扑训练台</h1>
+    <span class="meta" id="handMeta"></span>
+    <span class="spacer"></span>
+    <button class="link-btn" id="setupToggle">牌桌设置</button>
+  </header>
+
+  <section class="panel" id="setup">
+    <h2>牌桌设置</h2>
+    <div class="fields">
+      <div class="field">
+        <label for="seatCount">座位数</label>
+        <select id="seatCount"></select>
+      </div>
+      <div class="field">
+        <label for="startingStack">起始筹码</label>
+        <input id="startingStack" type="number" value="1000" min="1" step="1">
+      </div>
+      <div class="field">
+        <label for="smallBlind">小盲</label>
+        <input id="smallBlind" type="number" value="5" min="0" step="1">
+      </div>
+      <div class="field">
+        <label for="bigBlind">大盲</label>
+        <input id="bigBlind" type="number" value="10" min="1" step="1">
+      </div>
+      <div class="field">
+        <label for="ante">前注</label>
+        <input id="ante" type="number" value="0" min="0" step="1">
+      </div>
+    </div>
+    <div class="seat-styles" id="seatStyles"></div>
+    <div style="margin-top:14px">
+      <button class="primary" id="createTable">开桌</button>
+    </div>
+    <div class="error" id="setupError"></div>
+  </section>
+
+  <section class="felt hidden" id="table">
+    <div class="seats" id="seats"></div>
+    <div class="middle">
+      <div class="street-tag" id="streetTag"></div>
+      <div class="board" id="board"></div>
+      <div class="pot" id="pot"></div>
+    </div>
+  </section>
+
+  <div class="log hidden" id="log"></div>
+</div>
+
+<div class="actionbar hidden" id="actionbar">
+  <div class="inner">
+    <div class="result" id="result"></div>
+    <div id="controls" class="hidden">
+      <div class="quick" id="quick"></div>
+      <div class="sizing" id="sizing">
+        <input type="range" id="raiseRange" min="0" max="0" step="1">
+        <span class="amount" id="raiseAmount">0</span>
+      </div>
+      <div class="buttons">
+        <button class="fold" id="btnFold">弃牌</button>
+        <button id="btnCheckCall">过牌</button>
+        <button class="raise" id="btnRaise">加注</button>
+      </div>
+    </div>
+    <div class="waiting hidden" id="waiting">对手行动中…</div>
+    <div class="buttons hidden" id="nextWrap">
+      <button class="raise" id="btnNext">下一手</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SUITS = { s: "♠", h: "♥", d: "♦", c: "♣" };
+let state = null;
+let styles = [];
+let socket = null;
+
+// ---------------------------------------------------------------- 工具
+
+function cardEl(text, small) {
+  const el = document.createElement("span");
+  el.className = "card" + (small ? " small" : "");
+  if (!text) { el.classList.add("back"); el.textContent = "??"; return el; }
+  const rank = text[0], suit = text[1];
+  el.textContent = rank + SUITS[suit];
+  if (suit === "h" || suit === "d") el.classList.add("red");
+  return el;
+}
+
+async function api(path, options) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+// ---------------------------------------------------------------- 设置
+
+function buildSeatStyleRows() {
+  const count = parseInt($("seatCount").value, 10);
+  const container = $("seatStyles");
+  container.innerHTML = "";
+  for (let seat = 0; seat < count; seat++) {
+    const row = document.createElement("label");
+    row.className = "seat-style";
+    const tag = document.createElement("span");
+    tag.textContent = seat === 0 ? "你" : "座位 " + seat;
+    row.appendChild(tag);
+    if (seat === 0) {
+      const fixed = document.createElement("select");
+      fixed.disabled = true;
+      fixed.innerHTML = "<option>真人</option>";
+      row.appendChild(fixed);
+    } else {
+      const select = document.createElement("select");
+      select.dataset.seat = String(seat);
+      select.className = "style-pick";
+      styles.forEach((style) => {
+        const option = document.createElement("option");
+        option.value = style.id;
+        option.textContent = style.label;
+        select.appendChild(option);
+      });
+      row.appendChild(select);
+    }
+    container.appendChild(row);
+  }
+}
+
+async function createTable() {
+  $("setupError").textContent = "";
+  const count = parseInt($("seatCount").value, 10);
+  const picks = {};
+  document.querySelectorAll(".style-pick").forEach((el) => {
+    picks[el.dataset.seat] = el.value;
+  });
+  const seats = [{ name: "你", isHuman: true, style: "tag" }];
+  for (let seat = 1; seat < count; seat++) {
+    seats.push({ name: "bot" + seat, isHuman: false, style: picks[seat] || "tag" });
+  }
+  try {
+    await api("/api/table", {
+      method: "POST",
+      body: JSON.stringify({
+        seats,
+        startingStack: parseInt($("startingStack").value, 10),
+        bigBlind: parseInt($("bigBlind").value, 10),
+        smallBlind: parseInt($("smallBlind").value, 10),
+        ante: parseInt($("ante").value, 10),
+      }),
+    });
+    $("setup").classList.add("hidden");
+    await api("/api/hand", { method: "POST" });
+  } catch (error) {
+    $("setupError").textContent = error.message;
+  }
+}
+
+// ---------------------------------------------------------------- 渲染
+
+function render() {
+  if (!state) return;
+  $("table").classList.remove("hidden");
+  $("log").classList.remove("hidden");
+  $("actionbar").classList.remove("hidden");
+  $("handMeta").textContent =
+    `第 ${state.handNo} 手 · 盲注 ${state.smallBlind}/${state.bigBlind}`;
+
+  // 座位
+  const seats = $("seats");
+  seats.innerHTML = "";
+  state.seats.forEach((seat) => {
+    const el = document.createElement("div");
+    el.className = "seat";
+    if (seat.isActing) el.classList.add("acting");
+    if (seat.folded) el.classList.add("folded");
+    if (seat.seat === state.heroSeat) el.classList.add("hero");
+
+    if (seat.seat === state.button) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "D";
+      el.appendChild(badge);
+    }
+
+    const top = document.createElement("div");
+    top.className = "seat-top";
+    const name = document.createElement("span");
+    name.className = "seat-name";
+    name.textContent = seat.name;
+    const pos = document.createElement("span");
+    pos.className = "seat-pos";
+    pos.textContent = seat.position;
+    top.append(name, pos);
+    if (seat.style) {
+      const style = document.createElement("span");
+      style.className = "seat-style-tag";
+      style.textContent = seat.style;
+      top.appendChild(style);
+    }
+    el.appendChild(top);
+
+    const stack = document.createElement("div");
+    stack.className = "seat-stack";
+    stack.textContent = seat.stack + (seat.allIn ? " · 全下" : "");
+    el.appendChild(stack);
+
+    const bet = document.createElement("div");
+    bet.className = "seat-bet";
+    bet.textContent = seat.committed > 0 ? "投入 " + seat.committed : "";
+    el.appendChild(bet);
+
+    const cards = document.createElement("div");
+    cards.className = "seat-cards";
+    if (seat.folded) {
+      // 弃牌后不显示牌位
+    } else if (seat.cards) {
+      seat.cards.forEach((c) => cards.appendChild(cardEl(c, seat.seat !== state.heroSeat)));
+    } else {
+      cards.append(cardEl(null, true), cardEl(null, true));
+    }
+    el.appendChild(cards);
+    seats.appendChild(el);
+  });
+
+  // 公共牌与底池
+  const board = $("board");
+  board.innerHTML = "";
+  state.board.forEach((c) => board.appendChild(cardEl(c)));
+  $("streetTag").textContent = state.street || "";
+  $("pot").innerHTML = state.pot ? `底池 <b>${state.pot}</b>` : "";
+
+  // 日志
+  const log = $("log");
+  log.innerHTML = "";
+  state.log.forEach((line) => {
+    const el = document.createElement("div");
+    el.textContent = line.text;
+    if (line.text.startsWith("发牌")) el.classList.add("street");
+    log.appendChild(el);
+  });
+  log.scrollTop = log.scrollHeight;
+
+  renderControls();
+}
+
+function renderControls() {
+  const controls = $("controls");
+  const waiting = $("waiting");
+  const nextWrap = $("nextWrap");
+  const result = $("result");
+
+  if (state.result) {
+    const net = state.result.net[state.heroSeat];
+    const label = net > 0 ? `<span class="win">本手 +${net}</span>`
+                : net < 0 ? `<span class="lose">本手 ${net}</span>`
+                : "本手打平";
+    result.innerHTML = label + (state.result.wentToShowdown ? " · 摊牌" : "");
+    controls.classList.add("hidden");
+    waiting.classList.add("hidden");
+    nextWrap.classList.remove("hidden");
+    return;
+  }
+
+  result.textContent = "";
+  nextWrap.classList.add("hidden");
+
+  if (!state.legal) {
+    controls.classList.add("hidden");
+    waiting.classList.toggle("hidden", !state.inProgress);
+    return;
+  }
+
+  waiting.classList.add("hidden");
+  controls.classList.remove("hidden");
+  const legal = state.legal;
+
+  $("btnFold").disabled = !legal.canFold;
+  const checkCall = $("btnCheckCall");
+  if (legal.canCheck) {
+    checkCall.textContent = "过牌";
+    checkCall.disabled = false;
+    checkCall.dataset.kind = "check";
+  } else if (legal.canCall) {
+    checkCall.textContent = `跟注 ${legal.callCost}`;
+    checkCall.disabled = false;
+    checkCall.dataset.kind = "call";
+  } else {
+    checkCall.textContent = "过牌";
+    checkCall.disabled = true;
+  }
+
+  const raiseBtn = $("btnRaise");
+  const range = $("raiseRange");
+  const sizing = $("sizing");
+  const quick = $("quick");
+  raiseBtn.disabled = !legal.canRaise;
+  sizing.classList.toggle("hidden", !legal.canRaise);
+  quick.classList.toggle("hidden", !legal.canRaise);
+
+  if (legal.canRaise) {
+    range.min = legal.minRaiseTo;
+    range.max = legal.maxRaiseTo;
+    const preferred = Math.min(legal.potSizedTo, legal.maxRaiseTo);
+    range.value = Math.max(legal.minRaiseTo, preferred);
+    updateRaiseLabel();
+
+    quick.innerHTML = "";
+    const options = [
+      ["最小", legal.minRaiseTo],
+      ["半池", Math.round((legal.minRaiseTo + legal.potSizedTo) / 2)],
+      ["底池", legal.potSizedTo],
+      ["全下", legal.maxRaiseTo],
+    ];
+    options.forEach(([label, value]) => {
+      const clamped = Math.max(legal.minRaiseTo, Math.min(value, legal.maxRaiseTo));
+      const button = document.createElement("button");
+      button.textContent = label;
+      button.onclick = () => { range.value = clamped; updateRaiseLabel(); };
+      quick.appendChild(button);
+    });
+  }
+}
+
+function updateRaiseLabel() {
+  const value = parseInt($("raiseRange").value, 10);
+  $("raiseAmount").textContent = value;
+  $("btnRaise").textContent =
+    state.legal && state.legal.isOpeningBet ? "下注" : "加注";
+}
+
+// ---------------------------------------------------------------- 动作
+
+async function send(kind, amount) {
+  try {
+    state = await api("/api/action", {
+      method: "POST",
+      body: JSON.stringify({ kind, amount: amount ?? null }),
+    });
+    render();
+  } catch (error) {
+    console.warn(error.message);
+  }
+}
+
+async function nextHand() {
+  try {
+    state = await api("/api/hand", { method: "POST" });
+    render();
+  } catch (error) {
+    console.warn(error.message);
+  }
+}
+
+// ---------------------------------------------------------------- 连接
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${scheme}://${location.host}/ws`);
+  socket.onmessage = (event) => { state = JSON.parse(event.data); render(); };
+  socket.onclose = () => setTimeout(connect, 1500);
+}
+
+async function init() {
+  const data = await api("/api/styles");
+  styles = data.styles;
+
+  const seatCount = $("seatCount");
+  for (let n = 2; n <= 9; n++) {
+    const option = document.createElement("option");
+    option.value = String(n);
+    option.textContent = n + " 人";
+    if (n === 6) option.selected = true;
+    seatCount.appendChild(option);
+  }
+  seatCount.onchange = buildSeatStyleRows;
+  buildSeatStyleRows();
+
+  $("createTable").onclick = createTable;
+  $("setupToggle").onclick = () => $("setup").classList.toggle("hidden");
+  $("btnFold").onclick = () => send("fold");
+  $("btnCheckCall").onclick = (e) => send(e.currentTarget.dataset.kind);
+  $("btnRaise").onclick = () => {
+    const value = parseInt($("raiseRange").value, 10);
+    send(state.legal.isOpeningBet ? "bet" : "raise", value);
+  };
+  $("raiseRange").oninput = updateRaiseLabel;
+  $("btnNext").onclick = nextHand;
+
+  connect();
+  try {
+    state = await api("/api/state");
+    $("setup").classList.add("hidden");
+    render();
+  } catch (error) {
+    // 还没开桌，留在设置面板
+  }
+}
+
+init();
+</script>
+</body>
+</html>
