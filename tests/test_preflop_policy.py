@@ -249,7 +249,7 @@ def test_bot_mostly_plays_from_the_table():
     """自对弈里大多数翻前决策应该走解，而不是兜底规则。"""
     from holdem.bots import Bot, play_out
 
-    bots = {seat: Bot("gto", seed=500 + seat) for seat in range(6)}
+    bots = {seat: Bot("solved", seed=500 + seat) for seat in range(6)}
     for index in range(30):
         hand = six_max(button=index % 6, seed=index * 13 + 2)
         play_out(hand, bots)
@@ -281,7 +281,7 @@ def test_styles_separate_in_the_expected_order():
                     played += 1
         return played / seen
 
-    tight, solved, loose = vpip("nit"), vpip("gto"), vpip("maniac")
+    tight, solved, loose = vpip("nit"), vpip("solved"), vpip("maniac")
     assert tight < solved < loose, f"岩石 {tight:.0%} / 照解 {solved:.0%} / 疯子 {loose:.0%}"
 
 
