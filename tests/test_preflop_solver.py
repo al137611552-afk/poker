@@ -8,8 +8,8 @@
 import pytest
 
 from holdem import equity_table
-from holdem.preflop_solver import solve_preflop
-from holdem.preflop_tree import PreflopConfig
+from holdem.preflop_solver import SqueezeRisk, solve_preflop
+from holdem.preflop_tree import PreflopConfig, build_tree
 from holdem.pushfold import solve_push_fold
 from holdem.ranges import NUM_HAND_CLASSES, class_from_name
 from holdem.realization import RealizationModel
@@ -220,3 +220,64 @@ def test_sharpening_makes_the_big_blind_defend_tighter():
     assert sharp_fold > flat_fold + 0.02, (
         f"大盲弃牌率 {flat_fold:.1%} → {sharp_fold:.1%}，锐化系数没起到作用"
     )
+
+
+# ------------------------------------------------------------------ 第三方接管终局
+
+
+def _main_line_terminal():
+    """「开牌 → 跟注」那个进翻牌的终局。六人桌的挤压就挂在这种终局上。"""
+    root = build_tree(TRIMMED).root
+    open_index = next(i for i, a in enumerate(root.actions) if a.is_raise)
+    reply = root.children[open_index]
+    call_index = next(i for i, a in enumerate(reply.actions) if a.kind == "call")
+    terminal = reply.children[call_index]
+    assert terminal.is_terminal
+    return reply, call_index, terminal.node_id
+
+
+def test_zero_probability_changes_nothing(trimmed):
+    """概率为 0 时必须逐位复现原来的解——混合公式的退化行为。"""
+    _, _, terminal = _main_line_terminal()
+    risk = SqueezeRisk(0.0, ((0.0,) * NUM_HAND_CLASSES, (-99.0,) * NUM_HAND_CLASSES))
+    same = solve_preflop(
+        TRIMMED,
+        squeeze={terminal: risk},
+        iterations=200,
+        tolerance=1e-3,
+        check_every=50,
+    )
+    assert same.player_ev == pytest.approx(trimmed.player_ev)
+
+
+def test_a_punishing_third_party_scares_the_caller_away(trimmed):
+    """跟注之后有人来收钱，跟注就该变少——这是挤压建模的作用机制。"""
+    reply, call_index, terminal = _main_line_terminal()
+    risk = SqueezeRisk(
+        0.5, ((0.0,) * NUM_HAND_CLASSES, (-8.0,) * NUM_HAND_CLASSES)
+    )
+    scared = solve_preflop(
+        TRIMMED,
+        squeeze={terminal: risk},
+        iterations=200,
+        tolerance=1e-3,
+        check_every=50,
+    )
+    before = trimmed.action_frequency(reply, call_index)
+    after = scared.action_frequency(reply, call_index)
+    assert after < before - 0.05, f"跟注 {before:.1%} → {after:.1%}，没被吓退"
+
+
+def test_third_party_cannot_be_hung_on_a_decision_node():
+    """挂错节点要当场报错——挂到决策点上会被无声忽略，那种 bug 最难查。"""
+    root = build_tree(TRIMMED).root
+    risk = SqueezeRisk(0.5, ((0.0,) * NUM_HAND_CLASSES,) * 2)
+    with pytest.raises(ValueError, match="不是终局"):
+        solve_preflop(TRIMMED, squeeze={root.node_id: risk}, iterations=1)
+
+
+def test_third_party_arguments_are_checked():
+    with pytest.raises(ValueError, match="接管概率"):
+        SqueezeRisk(1.5, ((0.0,) * NUM_HAND_CLASSES,) * 2)
+    with pytest.raises(ValueError, match="169"):
+        SqueezeRisk(0.5, ((0.0, 0.0), (0.0, 0.0)))

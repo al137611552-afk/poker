@@ -1,6 +1,7 @@
 """德扑训练台 · 牌局引擎（纯逻辑层）。"""
 
 from .actions import Action, ActionKind, LegalActions, bet, call, check, fold, raise_to
+from .batch import BatchResult, MatchConfig, SeatStats, merge, run_batch, shard
 from .cards import card_from_str, card_to_str, cards_from_str, cards_to_str
 from .deck import deck_from_seed, shuffled_deck, stacked_deck
 from .equity import exact_equity, monte_carlo_equity
@@ -11,6 +12,7 @@ from .equity_table import (
 )
 from .evaluator import describe, evaluate
 from .history import ActionRecord, action_records
+from .metrics import bb_per_100, bb_per_100_interval
 from .phh import parse_phh, phh_player_order, to_phh
 from .positions import position_names, position_of
 from .pots import Pot, award, build_pots, refund_uncalled
@@ -60,6 +62,14 @@ __all__ = [
     "TableSolution",
     "PushFoldSolution",
     "RealizationModel",
+    "MatchConfig",
+    "BatchResult",
+    "SeatStats",
+    "run_batch",
+    "shard",
+    "merge",
+    "bb_per_100",
+    "bb_per_100_interval",
     "build_tree",
     "solve_preflop",
     "solve_table",

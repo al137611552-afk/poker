@@ -13,6 +13,7 @@ from holdem.cards import cards_from_str
 from holdem.deck import deck_from_seed
 from holdem.equity import monte_carlo_equity
 from holdem.history import action_records
+from holdem import preflop_ranges
 from holdem.state import PREFLOP, HandConfig, HandState
 
 # ------------------------------------------------------------------ 权益
@@ -112,25 +113,33 @@ def test_unknown_style_is_rejected():
         Bot("超级高手")
 
 
-def test_styles_differ_in_looseness():
-    """疯子应该比岩石更常主动投钱——不比强弱，只验证参数确实起作用。"""
+def test_styles_bracket_the_solved_range():
+    """岩石紧于解、疯子松于解——风格是**相对解**定义的，验的就是这个相对关系。
 
-    def voluntary_rate(style):
+    别把入池率钉成绝对数字：`looseness` 是「入池频率相对解的倍数」，解一改
+    （比如 ADR-0004 补上挤压建模那次，枪口位开牌 20.8% → 14.8%），六档风格的绝对
+    水平就整体平移，钉死的门槛会连着炸两个测试。踩过一次。
+    """
+
+    def voluntary_rate(style, seeds=150):
         entered = 0
-        total = 0
-        for seed in range(60):
+        for seed in range(seeds):
             hand, _ = _table(6, seed=seed)
             bots = {seat: Bot(style, seed=seed * 10 + seat) for seat in range(6)}
             # 只看枪口位第一个决策
-            action = bots[hand.to_act].act(hand)
-            total += 1
-            if action.kind is not ActionKind.FOLD:
+            if bots[hand.to_act].act(hand).kind is not ActionKind.FOLD:
                 entered += 1
-        return entered / total
+        return entered / seeds
 
     nit = voluntary_rate("nit")
     maniac = voluntary_rate("maniac")
-    assert maniac > nit + 0.2, f"疯子 {maniac:.2f} 应明显松于岩石 {nit:.2f}"
+    assert maniac > 3 * nit, f"疯子 {maniac:.2f} 应远松于岩石 {nit:.2f}"
+
+    if preflop_ranges.is_available():
+        solved = preflop_ranges.load().open_frequency("UTG")
+        assert nit < solved < maniac, (
+            f"解在枪口位开 {solved:.1%}，岩石 {nit:.1%} 该更紧、疯子 {maniac:.1%} 该更松"
+        )
 
 
 def _preflop_stats(style, hands=120):
@@ -169,8 +178,10 @@ def test_style_archetypes_are_recognisable():
         f"入池率应随风格变松：岩石 {nit_vpip:.2f} < 紧凶 {tag_vpip:.2f} "
         f"< 松凶 {lag_vpip:.2f} < 疯子 {maniac_vpip:.2f}"
     )
+    # 绝对水平会随范围表整体平移（见 test_styles_bracket_the_solved_range），
+    # 所以门槛只用来防「风格根本没起作用」，别拿它当基准数字
     assert nit_vpip < 0.15, f"岩石入池率过高: {nit_vpip:.2f}"
-    assert maniac_vpip > 0.55, f"疯子入池率过低: {maniac_vpip:.2f}"
+    assert maniac_vpip > 0.45, f"疯子入池率过低: {maniac_vpip:.2f}"
     assert station_vpip > 0.4 and station_pfr < 0.12, (
         f"跟注站应松而不凶，实测 VPIP {station_vpip:.2f} / PFR {station_pfr:.2f}"
     )

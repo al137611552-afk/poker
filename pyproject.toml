@@ -22,8 +22,9 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-# 预计算的翻前权益表（约 112 KB），随包分发；由 scripts/build_preflop_equity.py 生成
-holdem = ["data/*.bin"]
+# 随包分发的预计算产物：翻前权益表（.bin，112 KB）与两张翻前范围表（.json）。
+# 少了 *.json，装出来的包会「表没生成」，所有 bot 悄悄退回兜底规则。
+holdem = ["data/*.bin", "data/*.json"]
 holdem_server = ["static/*"]
 
 [tool.pytest.ini_options]

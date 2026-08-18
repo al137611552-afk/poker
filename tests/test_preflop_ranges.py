@@ -139,3 +139,71 @@ def test_ranges_had_settled_when_the_table_was_written(table):
     assert table.max_change < 0.03, (
         f"这张表是在还在摆动（{table.max_change:.1%}）的时候写出来的，应加大 --sweeps 重跑"
     )
+
+
+# ------------------------------------------------------------------ 单挑那张表
+
+
+headsup_only = pytest.mark.skipif(
+    not preflop_ranges.HEADSUP_PATH.exists(),
+    reason="单挑范围表尚未生成，先跑 scripts/build_preflop_ranges.py --players 2",
+)
+
+
+@pytest.fixture(scope="module")
+def headsup():
+    return preflop_ranges.load(preflop_ranges.HEADSUP_PATH)
+
+
+@headsup_only
+def test_the_headsup_table_is_a_two_player_two_hundred_bb_solve(headsup):
+    """FR-6 拿它跟 Slumbot 打，所以人数与深度必须正好对上 Slumbot 的桌子。"""
+    assert headsup.num_players == 2
+    assert headsup.stack_bb == 200.0
+    assert headsup.positions == ("BTN",), "单挑只有按钮位开牌"
+    assert headsup.defenders_of("BTN") == ("BB",)
+
+
+@headsup_only
+def test_the_headsup_table_proves_itself_by_exploitability(headsup):
+    """单挑整树是**精确解**，所以它的自证是可利用度——六人桌那张拼出来的表没有这个数。
+
+    门槛按生成时的预算定（实测 0.0008），这里防的是量级失控。
+    """
+    assert headsup.exploitability is not None
+    assert 0.0 <= headsup.exploitability < 0.01, (
+        f"可利用度 {headsup.exploitability} 大盲/手，解得不够到位"
+    )
+
+
+@headsup_only
+def test_the_six_max_table_has_no_overall_exploitability(table):
+    """链式合成出来的表没有「整体可利用度」可言——别在那儿编一个数出来。"""
+    assert table.exploitability is None
+
+
+@headsup_only
+def test_the_headsup_button_opens_a_lot_but_not_everything(headsup):
+    """单挑按钮位该开得很宽，但不是全开。**别把这个数当基准**——它随兑现模型变。"""
+    percent = headsup.open_range("BTN").percent()
+    assert 0.45 < percent < 0.95, f"按钮位开牌 {percent:.1%} 不在合理区间"
+    for hand in ("AA", "KK", "AKs", "A5s"):
+        assert headsup.open_range("BTN").weight(class_from_name(hand)) > 0.9
+
+
+@headsup_only
+def test_the_big_blind_defends_most_of_the_time(headsup):
+    """单挑大盲面对开牌不该弃太多——他只需要投 1.5bb 就能拿到 3.5bb 的底池。"""
+    entry = headsup.defense("BTN", "BB")
+    assert entry.fold_frequency < 0.45, f"大盲弃 {entry.fold_frequency:.1%}，太多了"
+    assert entry.squeeze == 0.0, "单挑身后没有人，不存在挤压"
+    assert entry.advantage is not None, "风格层放宽范围要按它排序"
+
+
+@headsup_only
+def test_the_opener_has_a_reply_to_the_three_bet(headsup):
+    """「面对 3bet」那一格必须在表里——它是 FR-6 里第二常见的决策点。"""
+    entry = headsup.defense("BTN", "BB")
+    assert entry.reraise_reply, "缺了开牌者面对 3bet 的应对"
+    assert entry.facing_reraise == "加注到7.5"
+    assert set(entry.reraise_reply) >= {"弃牌", "跟注到7.5"}

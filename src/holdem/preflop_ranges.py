@@ -1,8 +1,17 @@
 """读取离线生成的翻前范围表。
 
-表由 `scripts/build_preflop_ranges.py` 算出来（解一次要十几分钟，见 `preflop_chain.py`），
-以 JSON 随包分发。这里只负责读取与查询，**不做任何求解**——运行时要的是查表的速度，
-不是重算的能力。
+表由 `scripts/build_preflop_ranges.py` 算出来，以 JSON 随包分发。这里只负责读取与查询，
+**不做任何求解**——运行时要的是查表的速度，不是重算的能力。
+
+随包有两张表，schema 相同、来路不同：
+
+| 产物 | 怎么解出来的 | 自证 |
+|---|---|---|
+| `preflop_ranges_6max_100bb.json` | 按位置拆成一串两人子博弈再链式合成（ADR-0004，约 23 分钟） | 范围还变不变（`max_change`） |
+| `preflop_ranges_hu_200bb.json` | 单挑整树**直接精确解**（ADR-0003，约 23 秒） | **可利用度**（`exploitability`） |
+
+单挑那张是自洽的：开牌 EV、防守者的 advantage 全部来自同一个解。六人桌那张是十几盘
+子博弈拼起来的，`exploitability` 只对单个子博弈有意义，所以整表那一项是 `None`。
 
 ```python
 table = preflop_ranges.load()
@@ -29,10 +38,15 @@ __all__ = [
     "RangeTableMissing",
     "is_available",
     "load",
+    "load_all",
 ]
 
 FORMAT = "PFRANGE1"
-DATA_PATH = Path(__file__).parent / "data" / "preflop_ranges_6max_100bb.json"
+DATA_DIR = Path(__file__).parent / "data"
+DATA_PATH = DATA_DIR / "preflop_ranges_6max_100bb.json"
+HEADSUP_PATH = DATA_DIR / "preflop_ranges_hu_200bb.json"
+PRODUCTS = (DATA_PATH, HEADSUP_PATH)
+"""随包分发的全部范围表。人数不同的桌各查各的表（`preflop_policy` 按人数分发）。"""
 
 
 class RangeTableMissing(RuntimeError):
@@ -56,6 +70,8 @@ class DefenseEntry:
     frequencies: dict[str, float]
     """动作标签 → 频率（按组合数加权，且只统计走得到这里的牌）。"""
     exploitability: float
+    squeeze: float = 0.0
+    """他跟注之后被身后挤压的概率（ADR-0004）。身后没人、或表是补这条之前生成的，就是 0。"""
     advantage: tuple[float, ...] | None = None
     """逐牌类的「继续比弃牌好多少」（大盲/手），风格层放宽范围时的排序依据。"""
     reraise_reply: dict[str, Range] | None = None
@@ -88,12 +104,25 @@ class PreflopRangeTable:
     model: dict
     """生成这张表用的权益兑现参数。"""
     sweeps: int
+    """链式求解扫了几轮；单挑整树解是 1（一次解完，没有「轮」这回事）。"""
     max_change: float
     opens: dict[str, Range]
     open_frequencies: dict[str, float]
     open_ev: dict[str, tuple[float, ...]]
     """逐牌类的开牌 EV（大盲/手）。老版本的表里没有这一项时是空的。"""
     defenses: dict[tuple[str, str], DefenseEntry]
+    exploitability: float | None = None
+    """整表的可利用度（大盲/手）。只有单挑整树解有这个数——它是自证的；
+    链式合成出来的表没有整体可利用度可言，那里是 `None`，逐格的在 `DefenseEntry` 里。"""
+
+    @property
+    def num_players(self) -> int:
+        return int(self.table["num_players"])
+
+    @property
+    def stack_bb(self) -> float:
+        """这张表是按多深的筹码解的（大盲）。深度差太多就别硬套，见 `preflop_policy`。"""
+        return float(self.table["effective_stack"])
 
     @property
     def positions(self) -> tuple[str, ...]:
@@ -159,6 +188,7 @@ def _load(path_text: str) -> PreflopRangeTable:
                     label: float(value) for label, value in entry["frequencies"].items()
                 },
                 exploitability=float(entry["exploitability"]),
+                squeeze=float(entry.get("squeeze", 0.0)),
                 advantage=tuple(entry["advantage"]) if entry.get("advantage") else None,
                 reraise_reply=(
                     {label: Range.parse(text) for label, text in reply["actions"].items()}
@@ -173,13 +203,28 @@ def _load(path_text: str) -> PreflopRangeTable:
                 facing_reraise=reply["facing"] if reply else None,
             )
 
+    exploitability = document.get("exploitability")
     return PreflopRangeTable(
         table=document["table"],
         model=document["model"],
-        sweeps=int(document["sweeps"]),
-        max_change=float(document["max_change"]),
+        sweeps=int(document.get("sweeps", 1)),
+        max_change=float(document.get("max_change", 0.0)),
+        exploitability=None if exploitability is None else float(exploitability),
         opens=opens,
         open_frequencies=frequencies,
         open_ev=open_ev,
         defenses=defenses,
     )
+
+
+def load_all(paths=PRODUCTS) -> dict[int, PreflopRangeTable]:
+    """读出所有随包分发的范围表，按人数索引。缺的产物直接跳过。
+
+    人数撞车（同一人数两张表）时后来的覆盖前面的——产物路径是写死的，不会真撞上。
+    """
+    tables: dict[int, PreflopRangeTable] = {}
+    for path in paths:
+        if path.exists():
+            table = load(path)
+            tables[table.num_players] = table
+    return tables

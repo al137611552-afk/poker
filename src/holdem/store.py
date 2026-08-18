@@ -20,6 +20,7 @@ from .cards import cards_to_str
 from .history import action_records
 from .phh import to_phh
 from .positions import position_of
+from .metrics import bb_per_100
 from .state import HandState
 
 SCHEMA_VERSION = 1
@@ -107,10 +108,8 @@ class PlayerSummary:
 
     @property
     def bb_per_100(self) -> float:
-        """每百手赢取的大盲数。手数为零时返回 0。"""
-        if not self.hands or not self.big_blind:
-            return 0.0
-        return 100.0 * self.net / self.big_blind / self.hands
+        """每百手赢取的大盲数。口径与批量对局、Slumbot 基线共用（`metrics.py`）。"""
+        return bb_per_100(self.net, self.hands, self.big_blind)
 
 
 class HandStore:

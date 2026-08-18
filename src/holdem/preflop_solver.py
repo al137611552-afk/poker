@@ -51,13 +51,50 @@ from .realization import (
     showdown_share_matrix,
 )
 
-__all__ = ["BranchValue", "PreflopSolution", "solve_preflop"]
+__all__ = [
+    "BranchValue",
+    "PreflopSolution",
+    "SqueezeRisk",
+    "action_advantage",
+    "solve_preflop",
+]
 
 _CLASSES = range(NUM_HAND_CLASSES)
 _COMBO_COUNT = tuple(class_combo_count(i) for i in range(NUM_HAND_CLASSES))
 
 
 # ------------------------------------------------------------------ 结果
+
+
+@dataclass(frozen=True)
+class SqueezeRisk:
+    """某个终局有一定概率**被第三方接管**：六人桌里防守者跟注之后身后有人挤压。
+
+    树里只有两个人，第三方进不来。所以挤压不进树，而是挂在「防守者跟注、行动结束」
+    那个终局上：以概率 `probability` 换成 `values` 给的收益，其余照常走翻后模型。
+
+    ```
+    收益(i, j) = (1 − p) · 原收益(i, j) + p · values[玩家][i]
+    ```
+
+    替代收益**只按自己的牌类**给（不看对手的 j）：挤压者是谁、他拿什么牌，已经在算
+    `values` 的那一层积分掉了（见 `preflop_chain._squeeze_risk`）。
+
+    注意这条支路上的钱有一部分被第三方拿走，**所以带挤压的子博弈不再是「两人零和 +
+    死钱」**——`PreflopSolution.player_ev` 之和会小于 `dead_money`，差额就是挤压者的所得。
+    """
+
+    probability: float
+    values: tuple[tuple[float, ...], tuple[float, ...]]
+    """被接管时两人各自的逐牌类净得失（大盲/手），与终局收益同口径（含已投入的钱）。"""
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.probability <= 1.0:
+            raise ValueError(f"接管概率越界: {self.probability}")
+        if len(self.values) != 2 or any(
+            len(row) != NUM_HAND_CLASSES for row in self.values
+        ):
+            raise ValueError("替代收益必须是两人各 169 个牌类")
 
 
 @dataclass(frozen=True)
@@ -123,9 +160,18 @@ class PreflopSolution:
     """
     hand_ev: tuple[tuple[float, ...], tuple[float, ...]]
     """逐牌类的期望得失（大盲/手）。链式求解靠它把子博弈的价值传回上一层。"""
-    root_branches: tuple[BranchValue, ...]
-    """根节点每个动作分支下的价值，供链式求解合并（比如「防守者没弃牌」）。"""
+    node_branches: dict[int, tuple[BranchValue, ...]]
+    """决策点 → 每个动作分支下的价值，供上层合并（比如「防守者没弃牌」）。
+
+    默认只算根节点（那是链式求解要的）；`solve_preflop(branch_nodes=…)` 可以点名多算几个
+    ——单挑整树解要在**防守者那个节点**上取「继续比弃牌好多少」，就靠它。
+    """
     iterations: int
+
+    @property
+    def root_branches(self) -> tuple[BranchValue, ...]:
+        """根节点各动作分支的价值。"""
+        return self.node_branches[self.tree.root.node_id]
 
     @staticmethod
     def _id(node: DecisionNode | int) -> int:
@@ -177,6 +223,39 @@ class PreflopSolution:
         return taken / arriving if arriving > 0 else 0.0
 
 
+def action_advantage(
+    solution: "PreflopSolution", node: DecisionNode | int | None = None
+) -> tuple[float, ...]:
+    """在某个决策点上，「不弃牌」比「弃牌」每手好多少（大盲/手），逐牌类。
+
+    风格层放宽范围时要有个顺序：先纳进来的应该是**最接近该打**的牌。这个顺序不该靠
+    「权益高低」之类的外部猜测——求解器本来就算出了每手牌两条路的价值，差值就是答案。
+
+    没有弃牌这个动作（能免费过牌）时全部返回 0：那种局面无所谓松紧。
+    """
+    tree_root = solution.tree.root
+    target = tree_root if node is None else node
+    node_id = target if isinstance(target, int) else target.node_id
+    decision = next(d for d in solution.tree.decisions if d.node_id == node_id)
+    branches = solution.node_branches.get(node_id)
+    if branches is None:
+        raise KeyError(
+            f"节点 {node_id} 没有算分支价值；求解时用 branch_nodes 点名它"
+        )
+    player = decision.player
+    fold_index = next(
+        (i for i, action in enumerate(decision.actions) if action.kind == "fold"), None
+    )
+    if fold_index is None:
+        return (0.0,) * NUM_HAND_CLASSES
+    fold_ev = branches[fold_index].hand_ev(player)
+    others = [b for b in branches if b.action != fold_index]
+    if not others:
+        return (0.0,) * NUM_HAND_CLASSES
+    continue_ev = combine(others, player=player)
+    return tuple(continue_ev[i] - fold_ev[i] for i in _CLASSES)
+
+
 # ------------------------------------------------------------------ 终局
 
 
@@ -202,6 +281,28 @@ class _TerminalEval:
     def values_for(self, player: int, reach_other: list[float]) -> list[float]:
         rows = self.rows[player]
         return [sum(map(mul, rows[i], reach_other)) for i in _CLASSES]
+
+
+def _blend_risk(evaluation: _TerminalEval, risk: SqueezeRisk) -> _TerminalEval:
+    """把「被第三方接管」按概率混进一个终局的收益里。
+
+    行已经预乘过共牌权重，所以替代收益也要乘上同一份权重才对得齐——
+    `rows[player][i][j]` 的行下标 `i` 一律是**自己**的牌类。
+    """
+    removal = removal_rows()
+    keep = 1.0 - risk.probability
+    take = risk.probability
+    rows = tuple(
+        tuple(
+            tuple(
+                keep * evaluation.rows[player][i][j] + take * risk.values[player][i] * removal[i][j]
+                for j in _CLASSES
+            )
+            for i in _CLASSES
+        )
+        for player in (0, 1)
+    )
+    return _TerminalEval(rows)
 
 
 def _build_terminal(node: TerminalNode, config: PreflopConfig, model: RealizationModel):
@@ -254,6 +355,8 @@ def solve_preflop(
     *,
     model: RealizationModel | None = None,
     priors: tuple[Range | None, Range | None] = (None, None),
+    squeeze: dict[int, SqueezeRisk] | None = None,
+    branch_nodes: tuple[int, ...] = (),
     iterations: int = 400,
     tolerance: float = 1e-3,
     check_every: int = 25,
@@ -263,6 +366,12 @@ def solve_preflop(
     `priors` 给每个玩家一个**先验范围**：走进这棵树时他手上可能是些什么牌。链式求解里
     「面对开牌」的子博弈就是这么用的——开牌者的范围由上一层定死，不在子博弈里重解。
     默认两边都是全范围。
+
+    `squeeze` 给「终局编号 → `SqueezeRisk`」，把身后第三方接管的可能性挂到指定终局上；
+    六人桌链式求解用它建模挤压（ADR-0004 简化 ③），单挑用不上。
+
+    `branch_nodes` 点名除根节点外还要算哪些决策点的分支价值（每个点名的节点多走几遍树，
+    默认不算是因为整桌链式求解每轮要解十几盘，只用得上根节点那一份）。
 
     可利用度低于 `tolerance`（大盲/手）即提前停止。
     """
@@ -277,8 +386,13 @@ def solve_preflop(
 
     tree = build_tree(cfg)
     realization = model or RealizationModel()
-    solver = _Solver(tree, realization, priors)
-    return solver.run(iterations=iterations, tolerance=tolerance, check_every=check_every)
+    solver = _Solver(tree, realization, priors, squeeze)
+    return solver.run(
+        iterations=iterations,
+        tolerance=tolerance,
+        check_every=check_every,
+        branch_nodes=branch_nodes,
+    )
 
 
 class _Solver:
@@ -287,6 +401,7 @@ class _Solver:
         tree: PreflopTree,
         model: RealizationModel,
         priors: tuple[Range | None, Range | None] = (None, None),
+        squeeze: dict[int, SqueezeRisk] | None = None,
     ) -> None:
         self.tree = tree
         self.model = model
@@ -300,9 +415,16 @@ class _Solver:
             )
             for player in (0, 1)
         )
-        self.terminals = {
-            node.node_id: _build_terminal(node, tree.config, model) for node in tree.terminals
-        }
+        risks = dict(squeeze or {})
+        self.terminals = {}
+        for node in tree.terminals:
+            evaluation = _build_terminal(node, tree.config, model)
+            risk = risks.pop(node.node_id, None)
+            if risk is not None:
+                evaluation = _blend_risk(evaluation, risk)
+            self.terminals[node.node_id] = evaluation
+        if risks:
+            raise ValueError(f"这些编号不是终局，挂不上第三方接管: {sorted(risks)}")
         self.regrets = {
             node.node_id: [[0.0] * len(node.actions) for _ in _CLASSES]
             for node in tree.decisions
@@ -315,7 +437,14 @@ class _Solver:
 
     # -------------------------------------------------------------- 主循环
 
-    def run(self, *, iterations: int, tolerance: float, check_every: int) -> PreflopSolution:
+    def run(
+        self,
+        *,
+        iterations: int,
+        tolerance: float,
+        check_every: int,
+        branch_nodes: tuple[int, ...] = (),
+    ) -> PreflopSolution:
         used = 0
         for step in range(1, iterations + 1):
             used = step
@@ -337,29 +466,51 @@ class _Solver:
             exploitability=gap,
             player_ev=evs,
             hand_ev=hand_ev,
-            root_branches=self._root_branches(),
+            node_branches=self._node_branches(branch_nodes),
             iterations=used,
         )
 
-    def _root_branches(self) -> tuple[BranchValue, ...]:
-        """根节点每个动作各走一遍，留下未归一化的价值。≤4 次遍历，很便宜。"""
+    def _node_branches(
+        self, extra: tuple[int, ...] = ()
+    ) -> dict[int, tuple[BranchValue, ...]]:
+        """指定决策点上，每个动作各走一遍，留下未归一化的价值。
+
+        根节点总是算（链式求解要），点名的再各算一份。每个节点 ≤4 次子树遍历，很便宜。
+        """
         root = self.tree.root
         if root.is_terminal:
-            return ()
-        actor = root.player
+            return {}
+        wanted = [root.node_id, *(n for n in extra if n != root.node_id)]
+        reaches = self._both_reaches()
+        result = {}
+        for node_id in wanted:
+            node = next(
+                (d for d in self.tree.decisions if d.node_id == node_id), None
+            )
+            if node is None:
+                raise ValueError(f"编号 {node_id} 不是决策点，算不了分支价值")
+            result[node_id] = self._branches_at(node, reaches[node_id])
+        return result
+
+    def _branches_at(
+        self, node, reach: tuple[list[float], list[float]]
+    ) -> tuple[BranchValue, ...]:
+        actor = node.player
         other = 1 - actor
-        strategy = self.average[root.node_id]
+        strategy = self.average[node.node_id]
         removal = removal_rows()
         branches = []
-        for action in range(len(root.actions)):
-            scaled = [self.priors[actor][i] * strategy[i][action] for i in _CLASSES]
-            reach = [None, None]
-            reach[actor] = scaled
-            reach[other] = list(self.priors[other])
-            values = self._average_values(root.children[action], reach)
-            # 行动者自己的除数不变（对手的到达概率没被限制），另一边要用被限制后的
+        for action in range(len(node.actions)):
+            scaled = [reach[actor][i] * strategy[i][action] for i in _CLASSES]
+            branch_reach = [None, None]
+            branch_reach[actor] = scaled
+            branch_reach[other] = list(reach[other])
+            values = self._average_values(node.children[action], branch_reach)
+            # 行动者自己的除数是对手带到这里的组合数，另一边要用被本次动作限制后的
             weights = [None, None]
-            weights[actor] = self.normalizers[actor]
+            weights[actor] = tuple(
+                sum(map(mul, removal[i], reach[other])) for i in _CLASSES
+            )
             weights[other] = tuple(sum(map(mul, removal[i], scaled)) for i in _CLASSES)
             branches.append(
                 BranchValue(
@@ -369,6 +520,24 @@ class _Solver:
                 )
             )
         return tuple(branches)
+
+    def _both_reaches(self) -> dict[int, tuple[list[float], list[float]]]:
+        """每个决策点上**双方**各自的到达概率。根节点就是两边的先验范围。"""
+        found: dict[int, tuple[list[float], list[float]]] = {}
+
+        def walk(node, own: list[list[float]]) -> None:
+            if node.is_terminal:
+                return
+            found[node.node_id] = (list(own[0]), list(own[1]))
+            strategy = self.average[node.node_id]
+            actor = node.player
+            for action, child in enumerate(node.children):
+                branch = list(own)
+                branch[actor] = [own[actor][i] * strategy[i][action] for i in _CLASSES]
+                walk(child, branch)
+
+        walk(self.tree.root, [list(self.priors[0]), list(self.priors[1])])
+        return found
 
     def _node_reaches(self) -> dict[int, tuple[float, ...]]:
         """每个决策节点上行动者的到达概率，只看他自己的动作，不含对手的。"""

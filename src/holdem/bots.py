@@ -28,11 +28,17 @@
 from __future__ import annotations
 
 import random
+import threading
 from dataclasses import dataclass
 
 from .actions import Action, bet, call, check, fold, raise_to
 from .equity import monte_carlo_equity
-from .preflop_policy import PolicyDecision, PreflopTablePolicy, parse_label
+from .preflop_policy import (
+    PolicyDecision,
+    PreflopPolicySet,
+    PreflopTablePolicy,
+    parse_label,
+)
 from .state import PREFLOP, HandState
 
 __all__ = ["BotStyle", "STYLES", "DEFAULT_STYLE", "Bot", "play_out", "shared_policy"]
@@ -82,21 +88,27 @@ _RELAX_PER_STEP = 0.05
 _BASE_RAISE_SHARE = 0.55
 """兜底里「够强就加注」的基准比例，再乘风格的 `aggression`。"""
 
-_SHARED: PreflopTablePolicy | None = None
+_SHARED: PreflopPolicySet | None = None
 _TRIED = False
+_LOCK = threading.Lock()
+"""**加载必须加锁**：多线程各开一条会话打（比如 `play_slumbot.py --workers 3`）时，
+一个 bot 正在建表，另一个看到「已经试过了」却拿到还没赋值的 `None`，
+于是整场退回兜底规则——覆盖率会莫名其妙地掉到一半，而且不报任何错。踩过一次。"""
 
 
-def shared_policy() -> PreflopTablePolicy | None:
-    """全进程共用一份范围表——它有几十 KB，还带着按局面预算好的排序，不该每个 bot 一份。
+def shared_policy() -> PreflopPolicySet | None:
+    """全进程共用一套范围表——它们有一百多 KB，还带着按局面预算好的排序，
+    不该每个 bot 一份。**按人数分发**：六人桌查六人表、单挑查单挑表。
 
-    表没生成时返回 `None`，所有 bot 自动退回规则策略（引擎不依赖产物也能跑）。
+    一张表都没生成时返回 `None`，所有 bot 自动退回规则策略（引擎不依赖产物也能跑）。
     """
     global _SHARED, _TRIED
-    if not _TRIED:
-        _TRIED = True
-        if PreflopTablePolicy.available():
-            _SHARED = PreflopTablePolicy()
-    return _SHARED
+    with _LOCK:
+        if not _TRIED:
+            if PreflopPolicySet.available():
+                _SHARED = PreflopPolicySet()
+            _TRIED = True
+        return _SHARED
 
 
 class Bot:
@@ -106,7 +118,7 @@ class Bot:
         self,
         style: BotStyle | str = DEFAULT_STYLE,
         seed: int | None = None,
-        policy: PreflopTablePolicy | None = None,
+        policy: "PreflopPolicySet | PreflopTablePolicy | None" = None,
     ) -> None:
         if isinstance(style, str):
             if style not in STYLES:

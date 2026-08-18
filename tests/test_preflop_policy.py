@@ -13,8 +13,10 @@ from holdem.preflop_policy import (
     LIMP,
     OPEN,
     VS_RERAISE,
+    PreflopPolicySet,
     PreflopSpot,
     PreflopTablePolicy,
+    effective_depth,
     identify,
     parse_label,
 )
@@ -66,7 +68,9 @@ def test_opener_facing_a_three_bet():
     hand.apply(fold())  # BTN
     hand.apply(fold())  # SB
     hand.apply(fold())  # BB
-    assert identify(hand, 6) == PreflopSpot(VS_RERAISE, "UTG", "UTG")
+    spot = identify(hand, 6)
+    assert spot == PreflopSpot(VS_RERAISE, "UTG", "UTG", reraiser="HJ")
+    assert spot.label == "UTG 开牌后面对 HJ 再加注"
 
 
 # ------------------------------------------------------------------ 表覆盖不到的局面
@@ -235,9 +239,38 @@ def test_passive_style_limps_instead_of_opening(policy):
 
 
 @pytestmark_table
+def test_the_reply_to_a_three_bet_comes_from_the_table(policy):
+    """「面对再加注」必须真的查到表里那一格。
+
+    表把开牌者的应对存在 `defense(开牌者, 3bet者).reraise_reply` 里——按**谁 3bet 的**
+    分格。策略层曾经拿 `defense(自己, 自己)` 去查，那一格永远不存在，于是这整行局面
+    一直在悄悄退回兜底规则，而所有测试都是绿的（连「72o 查不到」那条都因为查不到
+    而通过）。这个测试盯的就是「查得到」本身。
+    """
+    from holdem.deck import stacked_deck
+
+    hand = six_max(button=0, seed=4)
+    hand = HandState(
+        HandConfig(
+            stacks=[100 * BIG_BLIND] * 6, button=0, big_blind=BIG_BLIND, small_blind=50
+        ),
+        stacked_deck({5: "AhAs"}, num_seats=6, button=0, rest_seed=4),
+    )
+    for action in (fold(), fold(), raise_to(250), raise_to(750), fold(), fold()):
+        hand.apply(action)  # UTG弃 HJ弃 CO开 BTN 3bet SB弃 BB弃
+
+    decision = policy.decide(hand)
+    assert decision is not None, "CO 拿 AA 面对 3bet，表里必须有这一格"
+    assert decision.spot.kind == VS_RERAISE and decision.spot.reraiser == "BTN"
+    entry = policy.table.defense("CO", "BTN")
+    assert set(decision.weights) == set(entry.reraise_reply)
+    assert decision.weights["弃牌"] == 0.0, "AA 不会弃"
+
+
+@pytestmark_table
 def test_hands_that_never_arrive_have_no_solution(policy):
     """72o 从不开牌，所以「开牌被 3bet」这个节点它根本走不到，查表要回 None。"""
-    spot = PreflopSpot(VS_RERAISE, "UTG", "UTG")
+    spot = PreflopSpot(VS_RERAISE, "UTG", "UTG", reraiser="HJ")
     assert policy._weights(spot, class_from_name("72o")) is None
 
 
@@ -318,3 +351,136 @@ def test_table_fold_becomes_a_check_when_checking_is_free():
     bot = Bot("nit", seed=3, policy=None)
     decision = PolicyDecision(spot=PreflopSpot(OPEN, "BB", "BB"), weights={"弃牌": 1.0})
     assert bot._from_table(hand, legal, decision).kind is ActionKind.CHECK
+
+
+@pytestmark_table
+def test_the_shared_policy_survives_a_thread_stampede():
+    """几条线程同时要范围表时，每一条都得拿到表。
+
+    并行跑对局（`play_slumbot.py --workers N`）时每条线程各建一个 bot，都会来要这份共享
+    的表。加载要是不加锁，先到的那条会先把「试过了」立起来再去建表，后到的就拿到 `None`
+    ——那个 bot 整场退回兜底规则，覆盖率掉一半而且不报错。
+    """
+    import threading
+
+    from holdem import bots
+
+    with bots._LOCK:
+        bots._SHARED, bots._TRIED = None, False
+
+    ready = threading.Barrier(8)
+    got: list = []
+
+    def grab():
+        ready.wait()
+        got.append(bots.shared_policy())
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(got) == 8
+    assert all(policy is not None for policy in got), "有线程拿到了空策略"
+    assert len({id(policy) for policy in got}) == 1, "应当共用同一份，别每条线程各建一份"
+
+
+# ------------------------------------------------------------------ 哪张表
+
+
+def heads_up(stack_bb: float = 200.0, seed: int = 2) -> HandState:
+    """单挑：按钮即小盲、翻前先说话（与引擎、与 Slumbot 同一口径）。"""
+    config = HandConfig(
+        stacks=[int(stack_bb * BIG_BLIND)] * 2,
+        button=0,
+        big_blind=BIG_BLIND,
+        small_blind=50,
+    )
+    return HandState(config, deck_from_seed(seed))
+
+
+def test_effective_depth_is_the_shallowest_stack():
+    config = HandConfig(
+        stacks=[10000, 4000, 8000], button=0, big_blind=BIG_BLIND, small_blind=50
+    )
+    hand = HandState(config, deck_from_seed(1))
+    assert effective_depth(hand) == 40.0, "最浅的那份筹码说了算"
+
+
+@pytestmark_table
+def test_the_policy_set_dispatches_by_table_size():
+    """六人桌查六人表、单挑查单挑表；没有对应人数的产物就交给兜底。"""
+    policies = PreflopPolicySet()
+    assert policies.for_seats(6) is not None
+
+    six = six_max()
+    assert policies.decide(six) is not None, "六人桌第一个开牌，表里有"
+
+    three = HandState(
+        HandConfig(stacks=[10000] * 3, button=0, big_blind=BIG_BLIND, small_blind=50),
+        deck_from_seed(1),
+    )
+    assert policies.decide(three) is None, "三人桌没有产物，该交给兜底"
+
+
+@pytest.mark.skipif(
+    not __import__("holdem.preflop_ranges", fromlist=["HEADSUP_PATH"]).HEADSUP_PATH.exists(),
+    reason="单挑范围表尚未生成",
+)
+def test_heads_up_hands_use_the_heads_up_table():
+    policies = PreflopPolicySet()
+    hand = heads_up()
+    decision = policies.decide(hand)
+    assert decision is not None, "单挑按钮位第一个行动，单挑表里有"
+    assert decision.spot == PreflopSpot(OPEN, "BTN", "BTN")
+    assert set(decision.weights) == {"加注到2.5", "弃牌"}
+
+
+@pytestmark_table
+def test_a_table_that_is_far_off_depth_is_not_used():
+    """20bb 的桌子照 100bb 的表打是错的——那个深度该走推/弃。
+
+    差一倍以内照用（翻前范围对深度没那么敏感），差得更多就交给兜底。
+    """
+    policy = PreflopTablePolicy()
+    assert policy.decide(six_max()) is not None, "100bb 正好对上"
+
+    def six_max_at(stack_bb):
+        config = HandConfig(
+            stacks=[int(stack_bb * BIG_BLIND)] * 6,
+            button=0,
+            big_blind=BIG_BLIND,
+            small_blind=50,
+        )
+        return HandState(config, deck_from_seed(1))
+
+    assert policy.decide(six_max_at(60)) is not None, "60bb 还在一倍以内"
+    assert policy.decide(six_max_at(20)) is None, "20bb 太浅，别硬套"
+    assert policy.decide(six_max_at(400)) is None, "400bb 太深，别硬套"
+
+
+@pytest.mark.skipif(
+    not __import__("holdem.preflop_ranges", fromlist=["HEADSUP_PATH"]).HEADSUP_PATH.exists(),
+    reason="单挑范围表尚未生成",
+)
+def test_heads_up_bots_open_at_the_solved_frequency():
+    """端到端：单挑自对弈打出来的开牌率要与表里的开牌频率对得上。
+
+    这条串起了整条链——认局面、按人数选表、查表、把标签翻成引擎动作。中间任何一环
+    悄悄退回兜底，这个数就会明显偏离（兜底是另一套阈值，不可能正好撞上）。
+    """
+    from holdem.batch import MatchConfig, run_batch
+    from holdem.preflop_ranges import HEADSUP_PATH, load
+
+    solved = load(HEADSUP_PATH).open_frequency("BTN")
+    result = run_batch(
+        MatchConfig(styles=("solved", "solved"), hands=400, start_stack=20_000, seed=9)
+    )
+    seat = result.seat(0)
+    assert seat.solve_coverage > 0.95, (
+        f"只有 {seat.solve_coverage:.0%} 的翻前决策走了解，链路多半断在某一环"
+    )
+    assert abs(seat.open_rate - solved) < 0.08, (
+        f"实测开牌 {seat.open_rate:.1%}，表里是 {solved:.1%}"
+    )

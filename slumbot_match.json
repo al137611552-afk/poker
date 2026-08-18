@@ -1,0 +1,23 @@
+{
+ "source": "slumbot",
+ "style": "solved",
+ "seconds": 2374.6,
+ "big_blind": 100,
+ "stack_bb": 200,
+ "bb_per_100": -79.022,
+ "interval_95": 99.351,
+ "stats": {
+  "hands": 3000,
+  "net": -237066,
+  "net_squares": 23136279540.0,
+  "hands_as_button": 1500,
+  "net_as_button": -23849,
+  "hands_as_big_blind": 1500,
+  "net_as_big_blind": -213217,
+  "showdowns": 732,
+  "aborted": 0,
+  "mismatches": [],
+  "table_decisions": 3108,
+  "fallback_decisions": 25
+ }
+}

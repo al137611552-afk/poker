@@ -12,6 +12,15 @@
 | 我开牌被 3bet，轮到我应对 | ✅ 面对再加注 |
 | **跛入局、多人底池、4bet 之后、我已经跟过一手** | ❌ 一律回 `None`，交给兜底策略 |
 
+## 哪张表
+
+随包有两张：六人 100bb 与单挑 200bb（schema 相同）。`PreflopPolicySet` **按桌上人数
+分发**——人数没有对应产物就回 `None`，交给兜底。
+
+**深度也要对得上**：范围表是按某个筹码深度解出来的，20bb 的桌子照 100bb 的表打是错的
+（那个深度该走推/弃）。所以深度差出**一倍以外**就不查表（`DEPTH_BAND`）。差一倍以内
+照用，是因为翻前范围对深度没那么敏感，而「有解可用」比「刚好那个深度」更重要。
+
 **回 `None` 不是缺陷是纪律**：表是按「一个开牌者 + 一个防守者」解出来的（ADR-0004），
 拿它去指导多人底池等于拿一份不适用的解冒充精确解，违反 PRD 的「诚实」这条非功能需求。
 
@@ -32,15 +41,18 @@ from functools import lru_cache
 from .equity_table import equity_vs_range
 from .history import action_records
 from .positions import position_of
-from .preflop_ranges import PreflopRangeTable, is_available, load
+from .preflop_ranges import PRODUCTS, PreflopRangeTable, is_available, load, load_all
 from .ranges import NUM_HAND_CLASSES, Range, class_combo_count, class_of
 from .realization import RealizationModel, realization_factors
 from .state import PREFLOP, HandState
 
 __all__ = [
+    "DEPTH_BAND",
     "PreflopSpot",
     "PolicyDecision",
     "PreflopTablePolicy",
+    "PreflopPolicySet",
+    "effective_depth",
     "parse_label",
 ]
 
@@ -55,6 +67,9 @@ OPEN = "开牌"
 DEFEND = "面对开牌"
 VS_RERAISE = "面对再加注"
 
+DEPTH_BAND = (0.5, 2.0)
+"""实际深度 / 表的深度，落在这个区间才查表。两端都是「差一倍」。"""
+
 
 @dataclass(frozen=True)
 class PreflopSpot:
@@ -63,6 +78,9 @@ class PreflopSpot:
     kind: str
     hero: str
     opener: str
+    reraiser: str | None = None
+    """3bet 的是谁。**面对再加注时必须有**——表里的应对是按「谁 3bet 的」分格存的
+    （`defense(开牌者, 3bet者).reraise_reply`），少了它就查不到那一格。"""
 
     @property
     def label(self) -> str:
@@ -70,7 +88,7 @@ class PreflopSpot:
             return f"{self.hero} 第一个开牌"
         if self.kind == DEFEND:
             return f"{self.hero} 面对 {self.opener} 开牌"
-        return f"{self.opener} 开牌后面对再加注"
+        return f"{self.hero} 开牌后面对 {self.reraiser} 再加注"
 
 
 @dataclass(frozen=True)
@@ -142,7 +160,7 @@ def identify(hand: HandState, table_seats: int) -> PreflopSpot | None:
             return None
         if [r for r in mine if r.seq > reraiser.seq]:
             return None  # 已经应对过了
-        return PreflopSpot(VS_RERAISE, hero, hero)
+        return PreflopSpot(VS_RERAISE, hero, hero, reraiser=reraiser.position)
 
     return None  # 4bet 之后的局面表里没有
 
@@ -150,12 +168,24 @@ def identify(hand: HandState, table_seats: int) -> PreflopSpot | None:
 # ------------------------------------------------------------------ 查表
 
 
+def effective_depth(hand: HandState) -> float:
+    """还在牌里的人中最浅的那份**起始**筹码，折成大盲。
+
+    用起始筹码而不是当前剩余：范围表描述的是「这手牌开始时有多深」，
+    中途投出去的钱不该让深度看起来变浅。
+    """
+    config = hand.config
+    alive = hand.contenders() or range(config.num_seats)
+    return min(config.stacks[seat] for seat in alive) / config.big_blind
+
+
 class PreflopTablePolicy:
     """按解出来的范围表给出翻前策略。表缺这个局面时回 `None`。"""
 
     def __init__(self, table: PreflopRangeTable | None = None) -> None:
         self.table = table if table is not None else load()
-        self.seats = int(self.table.table["num_players"])
+        self.seats = self.table.num_players
+        self.stack_bb = self.table.stack_bb
         # 开牌那一支的标签跟着表里的开牌尺度走，别写死 2.5——换尺度重算的表要能直接用
         self.open_label = f"加注到{float(self.table.table['open_to']):g}"
         self._rankings: dict[tuple, _Ranking] = {}
@@ -172,6 +202,9 @@ class PreflopTablePolicy:
         spot = identify(hand, self.seats)
         if spot is None:
             return None
+        ratio = effective_depth(hand) / self.stack_bb
+        if not DEPTH_BAND[0] <= ratio <= DEPTH_BAND[1]:
+            return None  # 深度差太多，这张表不适用——交给兜底
 
         index = class_of(*hand.hole[hand.to_act])
         weights = self._weights(spot, index)
@@ -235,7 +268,7 @@ class PreflopTablePolicy:
         return result
 
     def _ranking(self, spot: PreflopSpot) -> "_Ranking":
-        key = (spot.kind, spot.opener, spot.hero)
+        key = (spot.kind, spot.opener, spot.hero, spot.reraiser)
         if key not in self._rankings:
             self._rankings[key] = self._build_ranking(spot)
         return self._rankings[key]
@@ -282,8 +315,17 @@ class PreflopTablePolicy:
                 return None
             return {self.open_label: opened, "弃牌": 1.0 - opened}
 
+        # 面对开牌查的是「我作为防守者」那一格；面对再加注查的是「我开牌、他 3bet」
+        # 那一格里存的应对——**两者的键不一样**，取错了会一路查不到而悄悄退回兜底
+        key = (
+            (spot.opener, spot.hero)
+            if spot.kind == DEFEND
+            else (spot.hero, spot.reraiser)
+        )
+        if key[1] is None:
+            return None
         try:
-            entry = self.table.defense(spot.opener, spot.hero)
+            entry = self.table.defense(*key)
         except KeyError:
             return None
 
@@ -396,3 +438,40 @@ def _normalize(raw: dict[str, float]) -> dict[str, float] | None:
     if total <= 1e-9:
         return None
     return {label: value / total for label, value in raw.items()}
+
+
+class PreflopPolicySet:
+    """随包的几张范围表凑成一套策略：**按桌上人数分发**。
+
+    六人桌查六人表、单挑查单挑表；没有对应人数的产物就回 `None`，交给兜底策略。
+    对外的接口与单张表的 `PreflopTablePolicy` 一样，所以 `bots.Bot` 拿到哪一种都能用。
+    """
+
+    def __init__(self, policies: "dict[int, PreflopTablePolicy] | None" = None) -> None:
+        if policies is None:
+            policies = {
+                seats: PreflopTablePolicy(table)
+                for seats, table in load_all().items()
+            }
+        self.policies = policies
+
+    @classmethod
+    def available(cls) -> bool:
+        return any(path.exists() for path in PRODUCTS)
+
+    def for_seats(self, seats: int) -> PreflopTablePolicy | None:
+        return self.policies.get(seats)
+
+    def decide(
+        self, hand: HandState, *, looseness: float = 1.0, aggression: float = 1.0
+    ) -> PolicyDecision | None:
+        policy = self.policies.get(hand.config.num_seats)
+        if policy is None:
+            return None
+        return policy.decide(hand, looseness=looseness, aggression=aggression)
+
+    def __repr__(self) -> str:
+        parts = ", ".join(
+            f"{seats}人{policy.stack_bb:g}bb" for seats, policy in sorted(self.policies.items())
+        )
+        return f"PreflopPolicySet({parts or '空'})"

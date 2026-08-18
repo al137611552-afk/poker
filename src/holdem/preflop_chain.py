@@ -35,11 +35,48 @@ EV_开牌(i) = Πf_m · W                                  ← 全都弃了，�
    多人底池的终局要在三个以上对手的联合分布上积分，那是另一码事。
 2. **弃牌的人不带走牌**：不做「他弃牌所以他没有大牌」的共牌/条件化修正，各家弃牌频率
    按聚合值处理，与英雄的牌无关。
-3. **身后的人对防守者不构成威胁**：q 在子博弈里不用担心 q 之后还有人。这会让靠后位置的
-   防守略偏松。
+3. ~~**身后的人对防守者不构成威胁**~~：**已补上**，见下。
 
-这三条都会让解偏离真正的六人均衡；它们的方向已知（① ③ 使范围偏松），先记在这里，
-校准之后再评估要不要补。
+① ② 都会让解偏离真正的六人均衡，方向已知（① 使范围偏松），先记在这里，校准之后再
+评估要不要补。
+
+## 身后的挤压（补上的那条简化）
+
+只在两人子博弈里想事情，防守者跟注就永远没有后顾之忧——于是冷跟得远比真解宽，
+整桌的入池率也跟着虚高。真实的六人桌里，跟注之后身后每个人都可能**挤压**（squeeze），
+把跟注者夹在中间。所以这里给「防守者跟注、行动结束」那个终局挂上 `SqueezeRisk`：
+
+```
+以概率 S 被挤压 → 收益换成「防守者面对挤压」那一小盘的解
+以概率 1 − S 照常进翻牌
+```
+
+- **挤压者是谁**：q 身后的每一个人 r 各算一次，按「谁先挤压」的概率加权合成。
+  某个 r 的挤压频率取他**面对同一个开牌的 3bet 频率** × `SqueezeModel.frequency_scale`
+  ——面对「开牌 + 一个跟注」的挤压比单纯 3bet 要少，这个折扣是假设，不是测量值。
+- **被挤压之后怎么打**：再切一段子博弈（`_facing_squeeze`），q 可以弃/跟/4bet/全下，
+  照常用 CFR+ 解，所以强牌不会白白被挤走，弱牌该弃就弃。
+- **开牌者怎么办**：假设他弃牌，他投进去的 `open_to` 全部变成死钱由 q 与挤压者去争。
+  这条同时决定了开牌者在这条支路上的收益（−`open_to`），所以开牌范围也跟着收紧一点。
+  （他其实可以跟/4bet，那只会比弃牌更好，所以这里给的是他的下界。）
+- **用的是上一轮的 3bet 频率**：q 身后那几家的解在同一轮里还没算到，所以取上一轮的
+  ——与外层用平均范围重解是同一个套路。**第一轮没有可用数据，等于不建模挤压**。
+
+挤压之后**这条支路不再是两人零和**：底池有一部分被第三方拿走，`player_ev` 之和会小于
+死钱，差额就是挤压者的所得。这是模型的应有之义，不是账没平。
+
+## 还没建模的（新的已知简化）
+
+- q **3bet 之后**身后再有人冷 4bet，不建模（频率低一个量级）。
+- 挤压者只被建模成「加注」，他冷跟造成的多人底池仍然按 ① 处理。
+- 挤压尺度固定在 3bet 梯子上再加 `extra_bb`，不按人数/位置变化。
+
+## 幅度过头了（评估结果时记住这条）
+
+补上挤压之后，开牌范围比公开解**紧 2–4 个百分点**（此前是松 2–3 个）。方向对、幅度过头，
+最大嫌疑就是上面那条「被挤压时开牌者一律弃牌」——那是他的下界。
+**别拿公开图表去回调 `frequency_scale`**：那等于把别人的表当真值，与本项目
+「正确性靠可利用度自证、公开图表只作量级对照」的口径相悖。真校准走 ADR-0003 的 B 档。
 """
 
 from __future__ import annotations
@@ -47,17 +84,61 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .positions import position_names
-from .preflop_solver import PreflopSolution, combine, solve_preflop
-from .preflop_tree import SubgameConfig
+from .preflop_solver import (
+    PreflopSolution,
+    SqueezeRisk,
+    action_advantage,
+    combine,
+    solve_preflop,
+)
+from .preflop_tree import SubgameConfig, build_tree
 from .ranges import NUM_HAND_CLASSES, Range
 from .realization import RealizationModel
 
-__all__ = ["TableConfig", "OpenSpot", "TableSolution", "solve_table", "defender_advantage"]
+__all__ = [
+    "TableConfig",
+    "SqueezeModel",
+    "OpenSpot",
+    "TableSolution",
+    "solve_table",
+    "defender_advantage",
+]
 
 _CLASSES = range(NUM_HAND_CLASSES)
 
 
 # ------------------------------------------------------------------ 配置
+
+
+@dataclass(frozen=True)
+class SqueezeModel:
+    """身后挤压的建模参数。**和 `realization.py` 一样，这些是假设，不是测量值。**
+
+    所以测试只验性质（有人在身后才有挤压、越多人越紧、概率为 0 时退化成原来的解），
+    不把具体数字钉成基准；将来用实解校准（ADR-0003 的 B 档）时整体替换。
+    """
+
+    frequency_scale: float = 0.6
+    """挤压频率 = 该位置面对开牌的 3bet 频率 × 这个系数。
+
+    面对「开牌 + 一个跟注」时人们挤压得比单纯 3bet 少（底池更大但要过两关），
+    公开统计里大约是 3bet 频率的一半到六成。取 0.6 偏保守一侧（略多算挤压）。
+    """
+    extra_bb: float = 1.0
+    """挤压尺度在 3bet 梯子之上再加多少——底池里多了一个跟注者，主流打法要加价。
+
+    与树里「每有一个跛入者开牌 +1bb」是同一条惯例。
+    """
+    iterations: int = 120
+    """「面对挤压」那一小盘的 CFR+ 迭代数。树只有几个节点，比外面那盘便宜得多。"""
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.frequency_scale <= 2.0:
+            raise ValueError(f"挤压频率系数越界: {self.frequency_scale}")
+        if self.extra_bb < 0:
+            raise ValueError("挤压加价不能为负")
+        if self.iterations < 1:
+            raise ValueError("迭代次数至少为 1")
 
 
 @dataclass(frozen=True)
@@ -72,6 +153,8 @@ class TableConfig:
     open_to: float = 2.5
     reraise_multiples: tuple[float, ...] = (3.0, 2.2)
     jam_from_level: int = 2
+    squeeze: SqueezeModel | None = SqueezeModel()
+    """身后挤压的建模；`None` 表示关掉（回到 ADR-0004 原来的简化 ③）。"""
 
     def __post_init__(self) -> None:
         if self.num_players < 3:
@@ -133,6 +216,17 @@ class TableConfig:
         """不开牌直接弃掉的净得失。前位是 0，盲注位要亏掉已投入的钱。"""
         return -(self.posted(opener) + self.ante)
 
+    @property
+    def squeeze_to(self) -> float:
+        """挤压（面对「开牌 + 一个跟注」再加注）的目标额：3bet 梯子上再加价。"""
+        settings = self.squeeze or SqueezeModel()
+        ladder = (
+            self.open_to * self.reraise_multiples[0]
+            if self.reraise_multiples
+            else self.effective_stack
+        )
+        return min(ladder + settings.extra_bb, self.effective_stack)
+
 
 # ------------------------------------------------------------------ 结果
 
@@ -149,6 +243,8 @@ class OpenSpot:
     open_hand_ev: tuple[float, ...]
     """逐牌类的开牌 EV（大盲/手）。"""
     fold_value: float
+    squeezes: dict[int, float] = field(default_factory=dict)
+    """防守者座位 → 他跟注之后身后挤压的概率。没建模挤压时是空的。"""
 
     @property
     def open_frequency(self) -> float:
@@ -180,6 +276,7 @@ class TableSolution:
             spot = self.spots[seat]
             defenses = " ".join(
                 f"{self.config.position_name(d)}弃{100 * s.action_frequency(s.tree.root, 0):.0f}%"
+                + (f"(挤{100 * spot.squeezes[d]:.0f}%)" if spot.squeezes.get(d) else "")
                 for d, s in spot.defenses.items()
             )
             lines.append(f"{spot.name:>4s} 开牌 {100 * spot.open_frequency:5.1f}%   {defenses}")
@@ -210,6 +307,9 @@ def solve_table(
     openers = cfg.openers
     outer = {seat: _OuterStrategy(cfg.fold_value(seat)) for seat in openers}
     spots: dict[int, OpenSpot] = {}
+    # 「谁面对谁的开牌 3bet 多少」——建模挤压要用身后那几家的这个数。他们在同一轮里
+    # 还没轮到，所以取上一轮的；第一轮没有，等于第一轮不建模挤压。
+    profiles: dict[tuple[int, int], _DefenseProfile] = {}
     max_change = float("inf")
 
     for sweep in range(1, sweeps + 1):
@@ -217,15 +317,24 @@ def solve_table(
         for seat in openers:
             previous = spots[seat].open_frequency if seat in spots else None
             defenses = {}
+            squeezes: dict[int, float] = {}
             for defender in cfg.behind(seat):
-                defenses[defender] = solve_preflop(
-                    _facing_open(cfg, seat, defender),
+                subgame = _facing_open(cfg, seat, defender)
+                risk = _squeeze_risk(cfg, seat, defender, profiles, realization)
+                terminal = _flat_call_terminal(subgame) if risk is not None else None
+                if terminal is not None:
+                    squeezes[defender] = risk.probability
+                solution = solve_preflop(
+                    subgame,
                     model=realization,
                     priors=(None, outer[seat].average_range()),
+                    squeeze={terminal: risk} if terminal is not None else None,
                     iterations=inner_iterations,
                     tolerance=inner_tolerance,
                     check_every=max(inner_iterations // 4, 1),
                 )
+                defenses[defender] = solution
+                profiles[(seat, defender)] = _reraise_profile(solution)
             open_ev = _compose_open_ev(cfg, seat, defenses)
             outer[seat].update(open_ev, sweep)
             spots[seat] = OpenSpot(
@@ -235,6 +344,7 @@ def solve_table(
                 defenses=defenses,
                 open_hand_ev=open_ev,
                 fold_value=cfg.fold_value(seat),
+                squeezes=squeezes,
             )
             if previous is not None:
                 max_change = max(max_change, abs(spots[seat].open_frequency - previous))
@@ -250,21 +360,10 @@ def solve_table(
 def defender_advantage(solution: PreflopSolution) -> tuple[float, ...]:
     """防守者「继续」比「弃牌」每手好多少（大盲/手），逐牌类。
 
-    风格层放宽范围时要有个顺序：先纳进来的应该是**最接近该打**的牌。这个顺序不该靠
-    「权益高低」之类的外部猜测——求解器本来就算出了每手牌两条路的价值，差值就是答案。
+    子博弈的根节点就是防守者的决策点，所以直接取根节点那一份
+    （通用版在 `preflop_solver.action_advantage`，单挑整树解要指名到防守者那个节点）。
     """
-    root = solution.tree.root
-    fold_index = next(
-        (i for i, action in enumerate(root.actions) if action.kind == "fold"), None
-    )
-    if fold_index is None:
-        return (0.0,) * NUM_HAND_CLASSES
-    fold_ev = solution.root_branches[fold_index].hand_ev(0)
-    others = [b for b in solution.root_branches if b.action != fold_index]
-    if not others:
-        return (0.0,) * NUM_HAND_CLASSES
-    continue_ev = combine(others, player=0)
-    return tuple(continue_ev[i] - fold_ev[i] for i in _CLASSES)
+    return action_advantage(solution)
 
 
 def _facing_open(config: TableConfig, opener: int, defender: int) -> SubgameConfig:
@@ -289,6 +388,138 @@ def _facing_open(config: TableConfig, opener: int, defender: int) -> SubgameConf
         open_to=config.open_to,
         reraise_multiples=config.reraise_multiples,
         jam_from_level=config.jam_from_level,
+    )
+
+
+@dataclass(frozen=True)
+class _DefenseProfile:
+    """一个防守者面对开牌时的再加注（3bet）画像，用来估他会不会挤压。"""
+
+    frequency: float
+    range: Range
+
+
+def _reraise_profile(solution: PreflopSolution) -> _DefenseProfile:
+    """把「面对开牌」的解压成 3bet 频率 + 3bet 范围。
+
+    各个加注尺度是互斥的分支，权重直接相加（`union` 取最大值会漏掉一半）。
+    """
+    root = solution.tree.root
+    weights: dict[int, float] = {}
+    frequency = 0.0
+    for index, action in enumerate(root.actions):
+        if not action.is_raise:
+            continue
+        frequency += solution.action_frequency(root, index)
+        for hand, weight in solution.action_range(root, index).weights.items():
+            weights[hand] = min(1.0, weights.get(hand, 0.0) + weight)
+    return _DefenseProfile(frequency=frequency, range=Range(weights))
+
+
+def _flat_call_terminal(subgame: SubgameConfig) -> int | None:
+    """「防守者跟注、行动结束」那个终局的编号；挤压就挂在它上面。
+
+    这里重建一次树只为拿编号（十来个节点，几乎不要钱）。编号是按固定顺序发的，
+    所以与 `solve_preflop` 内部那棵树对得上——两处用的是同一个 `build_tree`。
+    """
+    root = build_tree(subgame).root
+    if root.is_terminal:
+        return None
+    for index, action in enumerate(root.actions):
+        if action.kind == "call":
+            child = root.children[index]
+            return child.node_id if child.is_terminal else None
+    return None
+
+
+def _facing_squeeze(
+    config: TableConfig, opener: int, defender: int, squeezer: int
+) -> SubgameConfig:
+    """切出「防守者跟了开牌，身后某一家挤压」的一段。玩家 0 是防守者、1 是挤压者。
+
+    开牌者按「弃牌」处理：他投进去的 `open_to`（含他的盲注与前注）原样留在底池里变成
+    死钱，由这两个人去争。账因此是平的——桌上每一分钱要么在某个人的 `posted` 里，
+    要么在 `dead_money` 里。
+    """
+    dead = config.open_to + config.ante
+    dead += sum(
+        config.posted(seat) + config.ante
+        for seat in range(config.num_players)
+        if seat not in (opener, defender, squeezer)
+    )
+    return SubgameConfig(
+        posted=(config.open_to, config.squeeze_to),
+        dead_money=dead,
+        ante=config.ante,
+        first_to_act=0,
+        in_position=1 if config.in_position_of(defender, squeezer) == squeezer else 0,
+        names=(config.position_name(defender), config.position_name(squeezer)),
+        raise_level=2,
+        last_raise_to=config.squeeze_to,
+        already_acted=(False, True),
+        effective_stack=config.effective_stack,
+        big_blind=config.big_blind,
+        open_to=config.open_to,
+        reraise_multiples=config.reraise_multiples,
+        jam_from_level=config.jam_from_level,
+    )
+
+
+def _squeeze_risk(
+    config: TableConfig,
+    opener: int,
+    defender: int,
+    profiles: dict[tuple[int, int], _DefenseProfile],
+    model: RealizationModel,
+) -> SqueezeRisk | None:
+    """防守者跟注之后被身后挤压的风险；没人在身后（或没建模）时是 `None`。
+
+    身后每一家各解一小盘「面对他的挤压」，再按「谁是第一个挤压的人」的概率合成。
+    """
+    settings = config.squeeze
+    if settings is None:
+        return None
+    squeezers = config.behind(defender)
+    if not squeezers:
+        return None
+    if config.squeeze_to >= config.effective_stack:
+        # 筹码浅到挤压就是全下：那是推弃的地盘，不在这个模型里
+        return None
+
+    values = [0.0] * NUM_HAND_CLASSES
+    remaining = 1.0
+    total = 0.0
+    for seat in squeezers:
+        profile = profiles.get((opener, seat))
+        if profile is None or not profile.range:
+            continue
+        chance = min(1.0, settings.frequency_scale * profile.frequency)
+        if chance < 1e-4:
+            continue
+        weight = remaining * chance
+        remaining -= weight
+        total += weight
+        solution = solve_preflop(
+            _facing_squeeze(config, opener, defender, seat),
+            model=model,
+            priors=(None, profile.range),
+            iterations=settings.iterations,
+            tolerance=1e-3,
+            check_every=max(settings.iterations // 4, 1),
+        )
+        defender_ev = solution.hand_ev[0]
+        for i in _CLASSES:
+            values[i] += weight * defender_ev[i]
+
+    if total < 1e-4:
+        return None
+    # 条件在「确实被挤压了」上，所以要除掉总概率
+    defender_values = tuple(values[i] / total for i in _CLASSES)
+    # 开牌者弃牌，亏掉他开出去的钱（这是他的下界：跟或 4bet 只会更好）
+    opener_value = -(config.open_to + config.ante)
+    return SqueezeRisk(
+        probability=total,
+        values=(defender_values, (opener_value,) * NUM_HAND_CLASSES),
     )
 
 

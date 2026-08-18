@@ -10,9 +10,20 @@
 import pytest
 
 from holdem import equity_table
-from holdem.preflop_chain import TableConfig, _compose_open_ev, _facing_open, solve_table
-from holdem.preflop_solver import combine
-from holdem.ranges import class_from_name
+from holdem.preflop_chain import (
+    SqueezeModel,
+    TableConfig,
+    _compose_open_ev,
+    _DefenseProfile,
+    _facing_open,
+    _facing_squeeze,
+    _flat_call_terminal,
+    _squeeze_risk,
+    solve_table,
+)
+from holdem.preflop_solver import combine, solve_preflop
+from holdem.ranges import Range, class_from_name
+from holdem.realization import RealizationModel
 
 pytestmark = pytest.mark.skipif(
     not equity_table.is_available(),
@@ -235,3 +246,134 @@ def test_table_needs_at_least_three_players():
 def test_sweeps_must_be_positive():
     with pytest.raises(ValueError, match="至少要扫一轮"):
         solve_table(TableConfig(num_players=3), sweeps=0)
+
+
+# ------------------------------------------------------------------ 身后的挤压
+
+FAST_SQUEEZE = SqueezeModel(iterations=30)
+"""测试用：把「面对挤压」那一小盘的迭代砍到够看方向就行。"""
+
+THREEBET = _DefenseProfile(frequency=0.20, range=Range.parse("88+, ATs+, KQs, AQo+"))
+"""一个写死的 3bet 画像。挤压频率取自它，所以测试不依赖任何一次真求解的结果。"""
+
+
+def test_squeeze_size_sits_above_the_three_bet_ladder():
+    assert SIX.squeeze_to == pytest.approx(2.5 * 3.0 + 1.0), "3bet 梯子上再加一个大盲"
+    assert TableConfig(squeeze=SqueezeModel(extra_bb=0.0)).squeeze_to == pytest.approx(7.5)
+
+
+def test_squeeze_subgame_keeps_the_money_accounted_for():
+    """挤压那一段：桌上每一分钱要么在两人的 `posted` 里，要么在死钱里。
+
+    开牌者被挤压后按弃牌处理，他开出去的 2.5 留在底池——所以死钱要**多出**这一份。
+    """
+    utg, hj, button = SIX.seat_of("UTG"), SIX.seat_of("HJ"), SIX.seat_of("BTN")
+    subgame = _facing_squeeze(SIX, utg, hj, button)
+    assert subgame.posted == pytest.approx((2.5, 8.5)), "防守者跟到 2.5、挤压者加到 8.5"
+    assert subgame.dead_money == pytest.approx(2.5 + 0.5 + 1.0), "开牌者的 2.5 加上两个盲注"
+    assert sum(subgame.posted) + subgame.dead_money == pytest.approx(15.0), "全桌总投入"
+
+
+def test_squeeze_subgame_starts_after_the_squeeze():
+    utg, hj, button = SIX.seat_of("UTG"), SIX.seat_of("HJ"), SIX.seat_of("BTN")
+    subgame = _facing_squeeze(SIX, utg, hj, button)
+    assert subgame.raise_level == 2, "开牌 1 次、挤压 2 次，防守者再加就是 4bet"
+    assert subgame.already_acted == (False, True), "挤压者刚说完话"
+    assert subgame.first_to_act == 0, "轮到被夹的那个人"
+    assert subgame.in_position == 1, "按钮翻后在 HJ 之后说话"
+
+
+def test_squeeze_subgame_counts_antes_once_on_each_side():
+    config = TableConfig(ante=0.125)
+    utg, hj, button = config.seat_of("UTG"), config.seat_of("HJ"), config.seat_of("BTN")
+    subgame = _facing_squeeze(config, utg, hj, button)
+    assert subgame.ante == pytest.approx(0.125), "两人自己那份走 ante"
+    assert subgame.dead_money == pytest.approx(2.5 + 0.125 + 1.5 + 3 * 0.125), (
+        "开牌者与另外三个不在场的人，各留下盲注与前注"
+    )
+
+
+def test_the_big_blind_has_nobody_behind():
+    """大盲身后没人，永远不该被挤压——这是「谁会被挤」这条口径的锚点。"""
+    utg, big_blind = SIX.seat_of("UTG"), SIX.seat_of("BB")
+    profiles = {(utg, seat): THREEBET for seat in SIX.behind(utg)}
+    assert _squeeze_risk(SIX, utg, big_blind, profiles, RealizationModel()) is None
+
+
+def test_no_squeeze_without_data_or_when_switched_off():
+    utg, hj = SIX.seat_of("UTG"), SIX.seat_of("HJ")
+    assert _squeeze_risk(SIX, utg, hj, {}, RealizationModel()) is None, "第一轮还没有画像"
+
+    off = TableConfig(squeeze=None)
+    profiles = {(utg, seat): THREEBET for seat in off.behind(utg)}
+    assert _squeeze_risk(off, utg, hj, profiles, RealizationModel()) is None
+
+
+def test_more_players_behind_means_more_squeeze_risk():
+    """身后四家比身后一家更容易被挤——概率按「谁先挤压」链式合成。"""
+    config = TableConfig(squeeze=FAST_SQUEEZE)
+    utg = config.seat_of("UTG")
+    profiles = {(utg, seat): THREEBET for seat in config.behind(utg)}
+    model = RealizationModel()
+    crowded = _squeeze_risk(config, utg, config.seat_of("HJ"), profiles, model)
+    lonely = _squeeze_risk(config, utg, config.seat_of("SB"), profiles, model)
+    assert 0.0 < lonely.probability < crowded.probability < 1.0
+    # 单个挤压者的频率 = 3bet 频率 × 系数
+    assert lonely.probability == pytest.approx(0.20 * FAST_SQUEEZE.frequency_scale)
+
+
+def test_squeeze_hurts_trash_more_than_premiums():
+    """被挤压时强牌能打回去、弱牌只能弃——所以替代收益必须是单调的那个方向。"""
+    config = TableConfig(squeeze=FAST_SQUEEZE)
+    utg = config.seat_of("UTG")
+    profiles = {(utg, seat): THREEBET for seat in config.behind(utg)}
+    risk = _squeeze_risk(config, utg, config.seat_of("HJ"), profiles, RealizationModel())
+    values = risk.values[0]
+    assert values[class_from_name("AA")] > values[class_from_name("72o")]
+    assert values[class_from_name("72o")] == pytest.approx(-2.5, abs=0.15), (
+        "垃圾牌被挤压就是弃掉，亏的正是跟进去的 2.5"
+    )
+    assert risk.values[1] == pytest.approx((-2.5,) * 169), "开牌者按弃牌算"
+
+
+def test_squeeze_risk_tightens_the_cold_call():
+    """核心方向：身后可能挤压时，**冷跟**变少、弃牌变多。
+
+    受罚的只有「跟注」这一条路：3bet 之后再被冷 4bet 不在模型里（新的已知简化），
+    所以 3bet 只会不减——一部分本来想跟的牌会改成 3bet。这正是真解里
+    「身后有人就 3bet 或弃牌、少冷跟」那套结构。
+    """
+    config = TableConfig(num_players=4, squeeze=FAST_SQUEEZE)
+    opener, defender = config.seat_of("CO"), config.seat_of("BTN")
+    subgame = _facing_open(config, opener, defender)
+    profiles = {(opener, seat): THREEBET for seat in config.behind(opener)}
+    risk = _squeeze_risk(config, opener, defender, profiles, RealizationModel())
+    terminal = _flat_call_terminal(subgame)
+    assert terminal is not None, "跟注之后就该结束这一段"
+
+    kwargs = dict(iterations=80, tolerance=1e-3, check_every=40)
+    calm = solve_preflop(subgame, **kwargs)
+    wary = solve_preflop(subgame, squeeze={terminal: risk}, **kwargs)
+
+    root = subgame_root = calm.tree.root
+    labels = {action.label: index for index, action in enumerate(root.actions)}
+    call = labels["跟注到2.5"]
+    fold = labels["弃牌"]
+    raise_ = labels["加注到7.5"]
+    assert wary.action_frequency(subgame_root, call) < calm.action_frequency(root, call) - 0.03
+    assert wary.action_frequency(subgame_root, fold) > calm.action_frequency(root, fold) + 0.03
+    assert wary.action_frequency(subgame_root, raise_) > calm.action_frequency(root, raise_) - 0.02
+
+
+def test_solved_table_records_who_could_be_squeezed(three_max):
+    """解出来的桌子上：只有身后还有人的防守者带挤压概率。"""
+    config = three_max.config
+    button, small_blind, big_blind = (
+        config.seat_of("BTN"),
+        config.seat_of("SB"),
+        config.seat_of("BB"),
+    )
+    squeezes = three_max.spot(button).squeezes
+    assert big_blind not in squeezes, "大盲身后没人"
+    assert 0.0 < squeezes[small_blind] < 1.0, "小盲跟注之后大盲可能挤压"
+    assert three_max.spot(small_blind).squeezes == {}, "小盲开牌只剩大盲，他身后没人"

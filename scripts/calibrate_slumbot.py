@@ -30,15 +30,14 @@ python3 scripts/calibrate_slumbot.py --report /tmp/slumbot.json     # 只看已�
    它在给定动作序列下的频率就是它自己的频率。但反过来说，我们**测不到**它面对不同
    开牌尺度时的反应——只测到我们打出的那一种。
 
-## 协议（实测所得，别照文档猜）
+## 协议
 
-- `POST /api/new_hand {"token": 上一手的token}`，`POST /api/act {"token":…, "incr": 动作}`。
-- `client_pos`：**0 = 我们是大盲**（它先说话），**1 = 我们是按钮/小盲**。带 token 开新手时
-  位置逐手轮换。
-- 动作串形如 `b200b500c/`：`b<数字>` 是**加注到的本手总额（筹码）**，`c` 兼表跟注与过牌，
-  `f` 弃牌，`/` 分街。
-- 尺度非法时回的是 `{"old_action":…, "error_msg": "Bet size too small"}`，注意字段名是
-  `error_msg` 不是 `error_message`。
+会话与动作串的解析都在 `holdem_slumbot`（与 FR-6 的对局基线共用同一套客户端），
+协议要点见 `holdem_slumbot.protocol` 的模块说明。这里只用到其中三件事：
+`Session`、`tokenize`、`facing_bet`。
+
+**注意 `b<数字>` 是「本街」的目标总额**，不是本手累计——这条实测确认过
+（`b200c/kb200c/kb400c/kb1600c` 一共输 2400）。本脚本只用到翻前，两者在翻前相同。
 """
 
 from __future__ import annotations
@@ -46,83 +45,24 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 import urllib.error
-import urllib.request
 from collections import Counter
 from pathlib import Path
 
-BASE = "https://slumbot.com/api"
-BIG_BLIND = 100
-"""Slumbot 的盲注是 50/100，筹码 20000（＝200bb）。"""
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from holdem_slumbot.client import Session, SlumbotError  # noqa: E402
+from holdem_slumbot.protocol import BIG_BLIND, facing_bet, tokenize  # noqa: E402
 
 SPOTS = ("它按钮首行动", "它大盲面对开牌", "它面对3bet")
-
-
-class SlumbotError(RuntimeError):
-    pass
-
-
-class Session:
-    """一条会话：token 串起连续的手牌，位置逐手轮换。"""
-
-    def __init__(self, timeout: float = 20.0, pause: float = 0.05) -> None:
-        self.token: str | None = None
-        self.timeout = timeout
-        self.pause = pause
-
-    def _post(self, path: str, payload: dict) -> dict:
-        request = urllib.request.Request(
-            f"{BASE}/{path}",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            body = json.loads(response.read())
-        if "error_msg" in body:
-            raise SlumbotError(f"{body['error_msg']}（此前动作 {body.get('old_action')!r}）")
-        if "token" in body:
-            self.token = body["token"]
-        time.sleep(self.pause)
-        return body
-
-    def new_hand(self) -> dict:
-        return self._post("new_hand", {"token": self.token} if self.token else {})
-
-    def act(self, incr: str) -> dict:
-        return self._post("act", {"token": self.token, "incr": incr})
 
 
 # ------------------------------------------------------------------ 动作串
 
 
 _BET = re.compile(r"b(\d+)")
-
-
-def tokenize(street: str) -> list[str]:
-    """把一条街的动作串拆成 `['b200', 'c']` 这样的记号。"""
-    tokens: list[str] = []
-    index = 0
-    while index < len(street):
-        char = street[index]
-        if char == "b":
-            end = index + 1
-            while end < len(street) and street[end].isdigit():
-                end += 1
-            tokens.append(street[index:end])
-            index = end
-        elif char in "cfk":
-            tokens.append(char)
-            index += 1
-        else:
-            index += 1
-    return tokens
-
-
-def facing_bet(action: str) -> bool:
-    """轮到我们时是不是面对一个下注（决定能不能弃牌）。"""
-    tokens = tokenize(action.split("/")[-1])
-    return bool(tokens) and tokens[-1].startswith("b")
 
 
 def classify(prefix: str, action_after: str) -> tuple[str, int | None]:
@@ -211,7 +151,7 @@ def collect(hands: int, out: Path, open_to: int, three_bet_multiple: float, chec
                 print(f"  [第 {errors} 个错误] {type(exc).__name__}: {exc}", flush=True)
             if errors > max(20, hands // 20):
                 raise RuntimeError(f"错误太多（{errors} 次），最后一个：{exc}") from exc
-            session.token = None  # 出错就换一条会话重开
+            session.reset()  # 出错就换一条会话重开
             time.sleep(1.0)
             continue
 
@@ -275,18 +215,8 @@ def report(path: Path) -> None:
 # ------------------------------------------------------------------ 对照
 
 
-def _on_path() -> None:
-    """采集不需要 holdem 包，只有对照才需要——用到时才把 src 挂上去。"""
-    import sys
-
-    source = str(Path(__file__).resolve().parent.parent / "src")
-    if source not in sys.path:
-        sys.path.insert(0, source)
-
-
 def _predict(model, *, stack_bb: float, open_to_bb: float, iterations: int) -> dict:
     """用我们的模型解一局单挑，取出与 Slumbot 三个格子对应的频率。"""
-    _on_path()
     from holdem.preflop_solver import solve_preflop
     from holdem.preflop_tree import PreflopConfig
 
@@ -322,7 +252,6 @@ def compare(path: Path, iterations: int, min_samples: int = 100) -> None:
 
     **不自动改默认值**：参数怎么定是有后果的决定，这里只给出对照与建议。
     """
-    _on_path()
     from holdem.realization import RealizationModel
 
     document = json.loads(path.read_text(encoding="utf-8"))
