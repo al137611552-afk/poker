@@ -6,13 +6,23 @@
 ## 常用命令
 
 ```bash
-.venv/bin/python -m pytest           # 全量单测（约 38 秒，含服务端与 PokerKit 互认）
+.venv/bin/python -m pytest           # 全量单测（约 2 分钟，含服务端与 PokerKit 互认）
 python3 -m pytest                    # 系统 Python：自动跳过需要额外依赖的测试
 python3 -m pytest tests/test_state.py -k all_in   # 跑单个主题
 python3 scripts/soak.py 200000       # 随机自对弈压测 + 牌谱往返抽验 + 吞吐测量
 python3 scripts/build_preflop_equity.py   # 重算翻前权益表（2 核约 22 分钟，通常不用跑）
-python3 scripts/build_preflop_ranges.py   # 重算六人桌翻前范围表（约 20 分钟，通常不用跑）
-.venv/bin/python -m pytest -m slow   # 慢测：翻前全枚举 + 完整翻前树求解（约 2 分钟）
+python3 scripts/build_preflop_ranges.py   # 重算六人桌翻前范围表（约 23 分钟，通常不用跑）
+python3 scripts/build_preflop_ranges.py --players 2 --iterations 2000   # 单挑 200bb 表（约 23 秒）
+
+# 批量对局（FR-4）与强度基线（FR-6）
+python3 scripts/play_batch.py --hands 10000 --workers 2       # 六个 bot 打一万手
+python3 scripts/play_batch.py --hands 2000 --db /tmp/s.sqlite # 顺带落库喂 M2 统计
+python3 scripts/play_slumbot.py --hands 600 --workers 3       # 跟 Slumbot 打，量 bb/100
+.venv/bin/python -m pytest -m slow   # 慢测：翻前全枚举 + 完整翻前树求解（约 6 分钟）
+
+# 翻后求解（M3）：先装 TexasSolver（AGPL，不随包走），再指环境变量
+export TEXAS_SOLVER_HOME=/root/tools/TexasSolver-v0.2.0-Linux
+.venv/bin/python -m pytest tests/test_solver.py -m slow   # 真跑一次求解（约 1 分钟）
 
 # 起服务（手机需与电脑同一 Wi-Fi，启动时会打印手机用的网址）
 PYTHONPATH=src .venv/bin/python -m holdem_server --port 8000
@@ -37,22 +47,36 @@ src/holdem/      纯逻辑引擎，不碰 IO、不摸随机数
   ranges.py      169 个起手牌类 + 范围记法；编号直接对应 13×13 图表布局
   equity.py      蒙特卡洛权益估算 + 精确枚举基准值（exact_equity）
   equity_table.py 预计算的 169×169 翻前权益表 + 共牌权重；只用 array，零依赖
-  data/          预计算数据（翻前权益表约 112 KB，随包分发）
+  data/          预计算数据（翻前权益表 112 KB + 两张范围表，随包分发）
   pushfold.py    短筹码推弃纳什求解（CFR+）；全项目唯一可精确求解的策略
   preflop_tree.py 翻前抽象博弈树（离散下注尺度的公共树，不含牌）
   realization.py  翻后收益的压缩模型（权益兑现系数）；参数是未校准的假设
   preflop_solver.py 翻前树的 CFR+ 求解器（两人）；正确性靠可利用度 + 退化交叉验证
   preflop_chain.py  六人桌按位置分解成一串两人子博弈，再链式合成开牌范围
-  preflop_ranges.py 读取离线生成的翻前范围表（只查表，不求解）
-  preflop_policy.py 把范围表接到活的牌局上：认局面、查表、翻译动作、风格层
+  preflop_ranges.py 读取离线生成的翻前范围表（只查表，不求解）；六人 100bb 与单挑 200bb 两张
+  preflop_policy.py 把范围表接到活的牌局上：认局面、按人数选表、查表、翻译动作、风格层
+  range_tracking.py 从打完的牌回推**翻牌时双方的范围**（翻后求解的第一个输入）
   bots.py        对手 bot：翻前查表（表没覆盖的局面退回规则）、翻后启发式 + 风格预设
+  metrics.py     bb/100 与置信区间——**全项目唯一的胜率口径**
+  batch.py       批量自对弈（FR-4）：一桌 bot 打上万手，bb/100 带置信区间 + 翻前统计
   store.py       SQLite 落库——引擎包里唯一的 IO 模块
 src/holdem_server/
   table.py       牌桌编排，不 import 任何 Web 框架，可脱离 HTTP 单测
   app.py         FastAPI 适配层：HTTP + WebSocket + 静态页
   static/        单文件前端（无构建步骤，手机浏览器直接可用）
+src/holdem_solver/   翻后求解适配层（M3 / ADR-0005）
+  request.py     局面 → TexasSolver 的命令文件（纯逻辑）
+  result.py      策略树 JSON → SolvedNode（纯逻辑）
+  evaluate.py    在解出来的树上算 EV 与 EV 损失（纯逻辑）——dump 里没有 EV，得自己算
+  review.py      打完的一手牌 → 逐个翻后决策点的 EV 损失（纯逻辑，FR-9 的接线）
+  backend.py     跑二进制 + 按指纹缓存——**这一层唯一碰进程与磁盘的地方**
+src/holdem_slumbot/  外部强度标尺（FR-6 / ADR-0002）
+  protocol.py    动作串 ↔ HandState 的翻译 + 拿 winnings 对账（纯逻辑）
+  client.py      HTTP 会话——**全项目唯一联网的地方**
+  match.py       对局循环 + bb/100（IO 靠注入的会话，可用假会话单测）
 tests/           单测；求值器用「双实现交叉验证」，牌谱用 PokerKit 外部互认
-scripts/soak.py  压测脚本
+scripts/        soak.py 压测、build_* 离线产物、play_batch.py 批量对局、
+                play_slumbot.py 强度基线、calibrate_slumbot.py 频率校准
 docs/            PRD / ARCHITECTURE / ADR / DEVLOG
 ```
 
@@ -85,6 +109,63 @@ docs/            PRD / ARCHITECTURE / ADR / DEVLOG
   解以外的牌。要沿「求解器算出的逐手 EV」排序移动入池频率。
 - **首位入池只有「开牌」一条路**（解里没有跛入），所以 `aggression < 1` 的风格由**风格层**
   补上跛入。这是风格层的行为、不是解的一部分，别把它当求出来的策略。
+- **bb/100 只有一处定义**（`metrics.py`）。批量自对弈、Slumbot 基线、牌谱库的玩家汇总
+  共用它，别在别处再写一遍——两处口径不同的胜率数字比没有数字更糟。
+  置信区间靠「和 + 平方和 + 手数」三个数合并，所以分片/多会话跑完直接相加即可。
+- **Slumbot 的下注额是「本街」目标总额**，与我们引擎的 raise-to 同口径（实测确认：
+  `b200c/kb200c/kb400c/kb1600c` 一共输 2400）。**过牌要发 `k`**，发 `c` 判 Illegal call。
+  `client_pos == 1` 才是**我们**先说话（我们是按钮/小盲）。
+- **跟 Slumbot 打的每一手都要对账**。它回的 `winnings` 是唯一外部真值，
+  `protocol.check_result` 拿它核对我们对这手牌的理解；报告里出现「对不上」，
+  那批 bb/100 直接作废，先修协议翻译。**报告里的「照解走 X%」是链路是否接通的体温计**
+  ——单挑表接上之后实测 97.4%（剩下的是 4bet 之后的局面）；要是又掉到 50% 上下，
+  先怀疑上面那条竞态，别怀疑表。
+- **翻后求解器是 CPU 版 TexasSolver，不是 GPU 版**（ADR-0005）。GPU 版 Windows-only、
+  只有 GUI、闭源、**没有任何命令行/API**，自动流程里用不了。它是 AGPL：**只调用、不随包发**，
+  路径靠 `TEXAS_SOLVER_HOME`，没装就明确报错，不许悄悄退回近似。
+- **求解器的格式坑**（都是实测才知道的）：① 范围**不能用 `+` 记法**，`99+` 会让它抛
+  `format not recognize` 然后 **SIGABRT**（退出码 134，什么都不输出）——我们自己的记法里
+  `+` 到处都是，最容易原样送进去；② 金额**可以是小数**；
+  ③ **它管 OOP 叫 player 1、IP 叫 player 0**，读进来要翻译成我们的口径（0=OOP）。
+- **`set_bet_sizes` 同一格发第二条命令是覆盖，不是追加**。33/63.6/75 各发一条，树里只剩
+  最后那个 75%——**不报任何错**，直到复盘时冒出「实战打的尺度树里没有」才暴露。
+  多个尺度必须写在同一行：`set_bet_sizes ip,flop,bet,33,63.6,75`。
+- **求解器把算出来的下注额取整到整数单位**。底池 5.5 打 33% 应是 1.815，树里给的是
+  `BET 2.000000`（36.4%）。所以命令文件里的单位不是大盲，而是 **1/10 大盲**
+  （`SolveRequest.scale`，粒度 0.1bb），解回来的金额由 `parse_result(..., scale=)` 除回大盲。
+  **改 `scale` 会换指纹**，老缓存自然失效（重解一遍即可，不用手工清）。
+- **dump 里没有 EV**，只有策略。所以 FR-9 的「EV 损失」由 `evaluate.py` 自己在解出来的树上
+  算（固定英雄两张牌、对手按解走）；**别拿「你打了低频动作」冒充 EV 损失**。
+  另外 `set_dump_rounds` 一层就十几 KB、两层能到几十 MB，要算跨街 EV 得导更深的树，
+  所以下注尺度个数要克制。
+- **发牌节点的子节点在 `dealcards` 里，不是 `childrens`**（而且没有下划线）。读错了会看到
+  「发牌节点没有子节点」，进而误判「跨街策略导不出来」——实测导得出来。
+  另外那 52 项**包含牌面上已有的牌**，子树是空占位符，必须按牌面过滤。
+- **「发牌节点下面是空的」有两种，别混**：①**双方（有效）全下**，后面本来就没有决策——
+  该我们自己把公共牌枚举完再摊牌；②**dump 层数不够**——必须报错。
+  判据不能只用「投入 == 有效筹码」（`allin_threshold` 会让「加注到 27、身后剩 3」也没有后续），
+  也不能用 `deal_number`（两种都是 0，实测）；`evaluate.py` 用的是**同一层有没有别的发牌节点
+  展开过**。
+- **EV 的口径**：最终底池 × 我方份额 − **我方从这个局面起投入的钱**。所以弃牌的 EV 恒等于
+  「−已投入」，这是可以逐笔对账的硬约束，测试就钉在这上面。
+- **解一个翻牌局面要几分钟**，所以缓存是必需品不是优化（按请求指纹存盘），
+  也所以**实战中现解不可行**——这一层只服务复盘。
+- **复盘的第一个输入是范围，范围错了后面全错而且看不出来**。`range_tracking.py` 只认表里
+  真有的线路（单次加注底池 / 3bet 底池），跛入、多人底池、4bet 之后、深度差一倍以外
+  一律抛 `NotCovered` 并说明原因——**别为了「能出个数」去凑一份不适用的范围**。
+- **实战打出的尺度必须先并进树里**（`BetSizes.with_size`），否则那个动作在解里根本不存在，
+  也就没法给它打分。相近的判据是 2 个百分点（33% 与 34% 是同一回事）。
+  **树里没有的尺度要如实报出来（`LineNotInTree`），不许四舍五入到最近的那个**——
+  一个说不清来路的「你亏了 2.3bb」比没有数字更糟。加注尺度不并树（求解器的 raise
+  百分比口径没实测过），所以实战的加注对不上时会被跳过。
+- **翻牌复盘的 dump 必须导满三层**（`dump_rounds=3`）。只导一层连**翻牌上的**决策都算不了
+  EV——任何一条走到转牌的路在树里都没有下文，而 EV 是把后面的期望积出来的。
+  `plan_review` 默认就是 3，代价是产物大、解得慢（这一层只服务复盘，不进实战）。
+- **一个决策点打不了分，不能让整手牌作废**。`score_plan` 逐点独立：尺度对不上、dump 层数
+  不够，都只让那个点带上 `skipped` 原因，其余的点照常出分。
+- **英雄的牌可能不在我们假设的范围里**（风格层本来就会打表外的牌）。EV 照样算得出来
+  （英雄的两张牌是固定的），但解在那个点上没给这手牌频率——`in_range` 标出来，
+  聚合成漏洞报告时别把这种点跟正常点混着平均。
 - **视图绝不能泄露对手底牌**。`TableSession.view()` 只公开英雄本人与摊牌者的牌，
   改动这里必须跑 `test_table.py` 与 `test_server.py` 里的泄露测试。
 - **权益数值的基准是 `exact_equity`（全枚举），不是蒙特卡洛**。翻前单个对局要枚举
@@ -109,10 +190,31 @@ docs/            PRD / ARCHITECTURE / ADR / DEVLOG
 - **完整六人翻前树有 62 万个节点**，单挑只有 40 个。所以六人桌**不建整棵树**，而是按位置
   拆成一串两人子博弈再链式合成（`preflop_chain.py`，ADR-0004）。想直接解整桌的念头先打消。
 - **范围表是离线产物，不是运行时算的**。改了兑现模型或开牌尺度，要重跑
-  `scripts/build_preflop_ranges.py`（约 20 分钟）才会生效；产物里存着当时的参数，
-  对不上就说明表过期了。
-- **链式求解有三条已知简化**（ADR-0004）：只有第一个不弃牌的人继续（不建模多人底池与挤压）、
-  弃牌者不带走牌、防守者不担心身后。前后两条都让范围偏松，评估结果时要把这个方向记在心里。
+  `scripts/build_preflop_ranges.py`（约 23 分钟）才会生效；产物里存着当时的参数，
+  对不上就说明表过期了。**单挑那张要单独重跑**（`--players 2`，约 23 秒）。
+- **两张表两条路子，别混**：六人桌是子博弈链式合成（自证＝范围还变不变 `max_change`），
+  **单挑是整树精确解**（自证＝可利用度，实测 0.0008 大盲/手）。所以整表的
+  `exploitability` 只有单挑那张有，六人桌那张是 `None`——那里没有「整体可利用度」可言。
+- **深度差一倍以外就不查表**（`preflop_policy._DEPTH_BAND`）。20bb 的桌子照 100bb 的表打
+  是错的，那个深度该走推/弃。差一倍以内照用：翻前范围对深度没那么敏感，
+  而「有解可用」比「刚好那个深度」更重要。
+- **「面对再加注」查的是 `defense(我, 3bet 我的人).reraise_reply`**，不是
+  `defense(我, 我)`。曾经就是查错了这个键，于是这整行局面**一直悄悄退回兜底规则**，
+  而所有测试都是绿的——连「72o 查不到」那条都因为查不到而通过。改这块盯着
+  `test_the_reply_to_a_three_bet_comes_from_the_table`。
+- **`shared_policy()` 的加载必须加锁**。多线程各开一条会话打（`play_slumbot.py --workers 3`）
+  时，一条线程先立起「试过了」的旗、另一条就拿到还没赋值的 `None`，那个 bot 整场退回
+  兜底规则——覆盖率掉一半而且不报任何错。实测踩过：97% 掉到 49%。
+- **链式求解的已知简化**（ADR-0004）：只有第一个不弃牌的人继续（不建模多人底池）、
+  弃牌者不带走牌。原来的第三条「防守者不担心身后」**已经补上**（2026-08-18，见 ADR 修订）：
+  防守者跟注之后按概率被身后挤压，挂在「跟注、行动结束」那个终局上。
+- **挤压建模让开牌范围偏紧 2–4 个百分点**（此前是偏松 2–3 个）。最大嫌疑是
+  「被挤压时开牌者一律弃牌」这个**下界**假设。方向对、幅度过头——评估结果时记住这条，
+  **别拿公开图表去回调 `SqueezeModel.frequency_scale`**，真校准走 ADR-0003 的 B 档。
+- **带挤压的子博弈不再是「两人零和 + 死钱」**：底池有一部分被第三方拿走，
+  `player_ev` 之和会小于 `dead_money`。写测试时守的是这条不等式，别照抄等式。
+- **挤压用的是上一轮的 3bet 频率**（身后那几家在同一轮里还没算到），所以
+  **第一轮扫描等于不建模挤压**。看单轮结果会以为没生效，那是正常的。
 - **子博弈里玩家 0 是防守者、玩家 1 是开牌者**。取错一侧会得到符号相反的 EV，而数值看着
   仍然「像那么回事」——`test_preflop_chain.py` 的凸包测试就是为这个设的。
 - 交叉验证的参考求值器在 `tests/test_evaluator.py`，替换快路径实现时用它当基准。
