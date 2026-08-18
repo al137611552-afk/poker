@@ -57,6 +57,15 @@ class FlopRanges:
     effective_stack: float
     line: str
     """翻前是怎么走到这儿的，写给人看：「单次加注底池」/「3bet 底池」。"""
+    aggressor_seat: int = -1
+    """翻前最后加注的那个人（单次加注底池＝开牌者，3bet 底池＝3bet 的人）。
+
+    翻后的场景全按这个人分：同一个「翻牌下注」，进攻方打出来是持续下注、
+    防守方打出来是领打（donk），是两件完全不同的事。
+    """
+
+    def is_aggressor(self, seat: int) -> bool:
+        return seat == self.aggressor_seat
 
     def range_of(self, seat: int) -> Range:
         if seat == self.oop_seat:
@@ -94,10 +103,12 @@ def flop_ranges(
     records = [r for r in action_records(hand) if r.street == PREFLOP]
     folded = {r.seat for r in records if r.kind == "fold"}
     survivors = [seat for seat in range(config.num_seats) if seat not in folded]
-    if len(survivors) != 2:
-        raise NotCovered(f"翻牌时还有 {len(survivors)} 个人，求解器只解两人")
+    # 先说「没走到翻牌」再说「人数不对」：翻前就收掉的牌活人只剩一个，
+    # 若按人数报错会说成「求解器只解两人」，把「牌局提前结束」误报成覆盖缺口
     if len(hand.board) < 3:
-        raise NotCovered("这手牌没走到翻牌")
+        raise NotCovered("翻前就结束了，没有翻后决策")
+    if len(survivors) != 2:
+        raise NotCovered(f"翻牌时还有 {len(survivors)} 个人（多人底池），求解器只解两人")
 
     raises = [r for r in records if r.kind == "raise"]
     calls = [r for r in records if r.kind == "call"]
@@ -117,6 +128,7 @@ def flop_ranges(
         caller = calls[0]
         if {opener.seat, caller.seat} != set(survivors):
             raise NotCovered("看到翻牌的两个人对不上开牌者与跟注者")
+        aggressor = opener.seat
         opener_range = _open_range(table, name[opener.seat])
         caller_range = _defense_range(table, name[opener.seat], name[caller.seat], "call")
         line = "单次加注底池"
@@ -129,6 +141,7 @@ def flop_ranges(
             raise NotCovered("3bet 之前有人冷跟，表里没有这种线路")
         if not [r for r in calls if r.seat == opener.seat and r.seq > reraiser.seq]:
             raise NotCovered("开牌者没有跟 3bet，这不是 3bet 底池")
+        aggressor = reraiser.seat
         entry = _defense_entry(table, name[opener.seat], name[reraiser.seat])
         by_seat = {
             reraiser.seat: _pick(entry.actions, "raise", f"{name[reraiser.seat]} 的 3bet"),
@@ -151,6 +164,7 @@ def flop_ranges(
         pot=_flop_pot(hand) / big_blind,
         effective_stack=_flop_stack(hand, survivors) / big_blind,
         line=line,
+        aggressor_seat=aggressor,
     )
 
 

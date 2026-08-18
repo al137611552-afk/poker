@@ -131,7 +131,7 @@ def test_a_four_bet_pot_is_not_covered():
 
 def test_a_hand_that_never_saw_a_flop_is_not_scored():
     hand = play([*OPEN_FOLDS, raise_to(250), fold(), fold()])
-    with pytest.raises(NotCovered, match="没走到翻牌|只解两人"):
+    with pytest.raises(NotCovered, match="翻前就结束了"):
         flop_ranges(hand)
 
 
@@ -146,3 +146,21 @@ def test_a_table_size_without_a_product_is_refused():
     hand = play([fold(), raise_to(250), call()], seats=4)
     with pytest.raises(NotCovered, match="4 人桌"):
         flop_ranges(hand)
+
+
+# ------------------------------------------------------------------ 谁是进攻方
+
+
+def test_the_last_preflop_raiser_is_the_aggressor():
+    """单次加注底池里是开牌者；这决定翻后同一个下注该叫持续下注还是领打。"""
+    hand = play([*OPEN_FOLDS, raise_to(250), fold(), call()])
+    setup = flop_ranges(hand)
+    assert setup.aggressor_seat == 0 and setup.is_aggressor(0)
+    assert not setup.is_aggressor(2), "跟注的大盲是防守方"
+
+
+def test_in_a_three_bet_pot_the_aggressor_is_the_three_bettor():
+    hand = play([*OPEN_FOLDS, raise_to(250), fold(), raise_to(900), call()])
+    setup = flop_ranges(hand)
+    assert setup.line == "3bet 底池"
+    assert setup.aggressor_seat == 2, "3bet 的大盲才是进攻方，不是开牌的按钮"

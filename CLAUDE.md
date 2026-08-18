@@ -24,6 +24,10 @@ python3 scripts/play_slumbot.py --hands 600 --workers 3       # 跟 Slumbot 打�
 export TEXAS_SOLVER_HOME=/root/tools/TexasSolver-v0.2.0-Linux
 .venv/bin/python -m pytest tests/test_solver.py -m slow   # 真跑一次求解（约 1 分钟）
 
+# 漏洞报告（FR-10）：钱从哪类局面漏出去
+python3 scripts/leak_report.py --hands 300 --plan-only    # 不求解，先看能复盘多少手
+.venv/bin/python scripts/leak_report.py --hands 300 --max-solves 8   # 真解（很贵，看下面那条坑）
+
 # 起服务（手机需与电脑同一 Wi-Fi，启动时会打印手机用的网址）
 PYTHONPATH=src .venv/bin/python -m holdem_server --port 8000
 ```
@@ -69,6 +73,7 @@ src/holdem_solver/   翻后求解适配层（M3 / ADR-0005）
   result.py      策略树 JSON → SolvedNode（纯逻辑）
   evaluate.py    在解出来的树上算 EV 与 EV 损失（纯逻辑）——dump 里没有 EV，得自己算
   review.py      打完的一手牌 → 逐个翻后决策点的 EV 损失（纯逻辑，FR-9 的接线）
+  leaks.py       按场景聚合 EV 损失并排序＝漏洞报告（纯逻辑，FR-10）
   backend.py     跑二进制 + 按指纹缓存——**这一层唯一碰进程与磁盘的地方**
 src/holdem_slumbot/  外部强度标尺（FR-6 / ADR-0002）
   protocol.py    动作串 ↔ HandState 的翻译 + 拿 winnings 对账（纯逻辑）
@@ -76,7 +81,8 @@ src/holdem_slumbot/  外部强度标尺（FR-6 / ADR-0002）
   match.py       对局循环 + bb/100（IO 靠注入的会话，可用假会话单测）
 tests/           单测；求值器用「双实现交叉验证」，牌谱用 PokerKit 外部互认
 scripts/        soak.py 压测、build_* 离线产物、play_batch.py 批量对局、
-                play_slumbot.py 强度基线、calibrate_slumbot.py 频率校准
+                play_slumbot.py 强度基线、calibrate_slumbot.py 频率校准、
+                leak_report.py 漏洞报告（先 --plan-only 看能复盘多少，再花钱求解）
 docs/            PRD / ARCHITECTURE / ADR / DEVLOG
 ```
 
@@ -158,6 +164,10 @@ docs/            PRD / ARCHITECTURE / ADR / DEVLOG
   **树里没有的尺度要如实报出来（`LineNotInTree`），不许四舍五入到最近的那个**——
   一个说不清来路的「你亏了 2.3bb」比没有数字更糟。加注尺度不并树（求解器的 raise
   百分比口径没实测过），所以实战的加注对不上时会被跳过。
+- **这台开发机跑不动真实范围的翻牌求解**：内存只有 3GB，而导满三层的产物按
+  「节点数 × 组合数」涨——20bb + 双方各 3 个牌类已经 163.7MB，真实范围（几百个组合）
+  是 GB 量级。所以 `leak_report.py` 的默认预算很小，且**默认解完就删 dump**；
+  真要成规模跑，去 Windows 那台（内存与核数都够）。
 - **翻牌复盘的 dump 必须导满三层**（`dump_rounds=3`）。只导一层连**翻牌上的**决策都算不了
   EV——任何一条走到转牌的路在树里都没有下文，而 EV 是把后面的期望积出来的。
   `plan_review` 默认就是 3，代价是产物大、解得慢（这一层只服务复盘，不进实战）。
