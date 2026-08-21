@@ -200,3 +200,96 @@ def test_an_empty_batch_is_a_valid_report():
     report = build_report([], hands=0)
     assert report.leaks == () and report.coverage == 0.0 and report.total_loss == 0.0
     assert report.per_100_hands(0.0) == 0.0
+
+
+# ------------------------------------------------------------------ 收敛度（FR-10 补）
+#
+# 覆盖率管「算了多少个点」，收敛度管「算出来的数当不当得了真」。解没收敛时，EV 损失里
+# 掺着求解器自己的残差；而负差按 0 算（上面那条测试），噪声在合计里**只加不减**——
+# 于是排行会朝「出现次数多的格子」倾斜。所以报告必须自己把这件事说出来。
+
+
+def test_exploitability_becomes_a_noise_floor_in_big_blinds():
+    """可利用度是「%底池」，得乘上底池才跟漏损同一把尺子。底池 6bb、10% → 0.6bb/点。"""
+    report = build_report(
+        [result([scored(point(prefix=[CHECKED]), 2.0)])],
+        hands=10,
+        exploitability=[10.0],
+        accuracy=1.0,
+    )
+    assert report.convergence.noise_floor == pytest.approx(0.6)
+    assert report.convergence.unconverged == 1, "10% 远超 1% 的门槛"
+    assert report.signal_to_noise == pytest.approx(2.0 / 0.6)
+
+
+def test_a_ranking_built_on_solver_noise_is_not_trustworthy():
+    """平均每点漏损跟残差一个量级 → 排行不可信；漏损大出几倍才可信。"""
+    noisy = build_report(
+        [result([scored(point(prefix=[CHECKED]), 0.5)])],
+        hands=10,
+        exploitability=[10.0],  # 0.6bb/点
+        accuracy=1.0,
+    )
+    assert noisy.ranking_trustworthy() is False
+
+    clean = build_report(
+        [result([scored(point(prefix=[CHECKED]), 0.5)])],
+        hands=10,
+        exploitability=[0.5],  # 0.03bb/点
+        accuracy=1.0,
+    )
+    assert clean.ranking_trustworthy() is True
+
+
+def test_missing_convergence_reads_as_unknown_not_as_good():
+    """没量到可利用度就是「判不了」。**别把不知道报成通过**——那正是没人发现问题的方式。"""
+    silent = build_report([result([scored(point(prefix=[CHECKED]), 2.0)])], hands=10)
+    assert silent.convergence is None
+    assert silent.signal_to_noise is None and silent.ranking_trustworthy() is None
+
+    unmeasured = build_report(
+        [result([scored(point(prefix=[CHECKED]), 2.0)])],
+        hands=10,
+        exploitability=[None],
+        accuracy=1.0,
+    )
+    assert unmeasured.convergence.unmeasured == 1
+    assert unmeasured.convergence.unconverged == 0, "量不到不等于没收敛，也不等于收敛了"
+    assert unmeasured.ranking_trustworthy() is None
+
+
+def test_the_solvers_own_gap_at_the_scored_spots_is_the_other_noise_floor():
+    """解在**打分那几个点上**离最优差多少，是不依赖日志的第二路残差；两路取大的。"""
+    sloppy = ScoredDecision(
+        point=point(prefix=[CHECKED]),
+        # 解自己混出来的 EV 是 −0.5，最优是 0：这个点上解还差着 0.5bb 没收敛
+        score=DecisionScore(
+            evs={"CHECK": 0.0, "BET 3.0": -1.0},
+            strategy={"CHECK": 0.5, "BET 3.0": 0.5},
+            taken="BET 3.0",
+        ),
+        label="BET 3.0",
+    )
+    report = build_report([result([sloppy])], hands=10)
+    assert report.mean_solver_gap == pytest.approx(0.5)
+    assert report.noise_floor == pytest.approx(0.5), "没有可利用度时就用它"
+    assert report.signal_to_noise == pytest.approx(1.0 / 0.5), "这个点漏了 1.0bb"
+    assert report.ranking_trustworthy() is False
+
+    # 可利用度更大（底池 6bb × 20% = 1.2bb）时，噪声底取那一路
+    louder = build_report([result([sloppy])], hands=10, exploitability=[20.0], accuracy=1.0)
+    assert louder.noise_floor == pytest.approx(1.2)
+
+
+def test_an_off_range_hand_contributes_no_solver_gap():
+    """英雄打的是表外牌 → 解没给它频率，`solved_ev` 会算成 0，那个 gap 是假的。"""
+    outside = ScoredDecision(
+        point=point(prefix=[CHECKED]),
+        score=DecisionScore(evs={"CHECK": 0.0, "BET 3.0": -2.0}, strategy={}, taken="BET 3.0"),
+        label="BET 3.0",
+        in_range=False,
+    )
+    report = build_report([result([outside])], hands=10)
+    assert report.scored_spots == 1
+    assert report.solver_gaps == () and report.mean_solver_gap is None
+    assert report.ranking_trustworthy() is None, "两路残差都没有＝判不了"

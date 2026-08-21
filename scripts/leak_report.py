@@ -24,6 +24,10 @@ python3 scripts/leak_report.py --hands 300 --plan-only    # 不求解，只看�
 ——**那是估计，不是测量**。
 
 排序按总漏损，不按平均：平均值最大的往往是一年遇不上几次的局面（见 `leaks.py`）。
+
+**先看「排行可信度」那一行再看排行**。EV 损失是拿实战动作跟解比出来的差，解要是没收敛，
+差里就掺着求解器自己的残差；报告把每个解的可利用度折成大盲（`可利用度% × 底池`）当噪声底，
+跟平均每点漏损比。比值小于 3 就别照着排行去改打法——**先加 `--iterations` 重跑**。
 """
 
 from __future__ import annotations
@@ -83,23 +87,30 @@ def make_plans(hands, seat: int, *, accuracy: float, iterations: int):
 
 
 def solve_and_score(plans, solver: TexasSolver, *, timeout: float, keep_cache: bool):
-    results = []
+    """真解并打分。**可利用度要一路带回去**——它决定这份报告可不可信（见 `leaks.py`）。"""
+    results, exploitability = [], []
     for index, plan in enumerate(plans, start=1):
         started = time.perf_counter()
         report = solver.solve(plan.request, timeout=timeout)
         results.append(score_plan(plan, report.root))
+        exploitability.append(report.exploitability)
         cache = solver.cache_dir / f"{report.fingerprint}.json"
         size = cache.stat().st_size / 1e6 if cache.is_file() else 0.0
         if not keep_cache and cache.is_file():
             cache.unlink()
+        accuracy = plan.request.accuracy
+        if report.exploitability is None:
+            verdict = "可利用度：求解器没报"
+        else:
+            gap = report.exploitability
+            verdict = f"可利用度 {gap:.3g}%" + ("" if gap <= accuracy else f"（**没收敛到 {accuracy:g}%**）")
         print(
             f"  [{index}/{len(plans)}] {len(plan.points)} 个决策点，"
             f"{time.perf_counter() - started:.0f}s，dump {size:.0f}MB"
-            f"{'（已缓存）' if report.cached else ''}"
-            f"，可利用度 {report.exploitability}%",
+            f"{'（已缓存）' if report.cached else ''}，{verdict}",
             flush=True,
         )
-    return results
+    return results, exploitability
 
 
 def render(report, *, plan_count: int, dealt: int) -> str:
@@ -127,6 +138,7 @@ def render(report, *, plan_count: int, dealt: int) -> str:
         lines.append(
             f"按覆盖率外推到全部牌局约 {extrapolated:.1f} bb/100——**这是外推，不是测量**"
         )
+    lines.extend(_convergence_lines(report))
     if report.skipped:
         lines.append("")
         lines.append("打不了分的决策点：")
@@ -138,6 +150,71 @@ def render(report, *, plan_count: int, dealt: int) -> str:
         for reason, count in report.uncovered_hands:
             lines.append(f"  {count:>4} × {reason}")
     return "\n".join(lines)
+
+
+def _convergence_json(report):
+    """收敛度也要进 JSON——**没有它，一份 leaks.json 事后没人判得出可不可信**。"""
+    gaps = report.convergence
+    document = {
+        "noise_floor_bb": None
+        if report.noise_floor is None
+        else round(report.noise_floor, 4),
+        "mean_loss_bb": round(report.mean_loss, 4),
+        "mean_solver_gap_bb": None
+        if report.mean_solver_gap is None
+        else round(report.mean_solver_gap, 4),
+        "signal_to_noise": None
+        if report.signal_to_noise is None
+        else round(report.signal_to_noise, 3),
+        "ranking_trustworthy": report.ranking_trustworthy(),
+    }
+    if gaps is not None:
+        document.update(
+            solves=gaps.solves,
+            accuracy_percent=gaps.accuracy,
+            exploitability_percent=[round(value, 4) for value in gaps.exploitability],
+            unmeasured=gaps.unmeasured,
+            unconverged=gaps.unconverged,
+        )
+    return document
+
+
+def _convergence_lines(report) -> list:
+    """把「这批解收敛了没有」写成人话。**这几行比排行本身更该先读。**"""
+    gaps = report.convergence
+    lines = ["", "解的收敛度："]
+    if gaps is not None and gaps.exploitability:
+        lines.append(
+            f"  可利用度 中位 {gaps.median:.3g}% / 最差 {gaps.worst:.3g}%（%底池）"
+            + (f"，门槛 {gaps.accuracy:g}%" if gaps.accuracy is not None else "")
+        )
+        if gaps.unconverged:
+            lines.append(f"  {gaps.unconverged}/{gaps.solves} 个解**没收敛到门槛**")
+    if gaps is None:
+        lines.append("  求解器一个可利用度都没报（当未知，不当收敛）")
+    elif gaps.unmeasured:
+        lines.append(f"  {gaps.unmeasured}/{gaps.solves} 个解量不到可利用度（当未知，不当收敛）")
+    if report.mean_solver_gap is not None:
+        lines.append(
+            f"  打分那 {len(report.solver_gaps)} 个点上，解自己平均还差 "
+            f"{report.mean_solver_gap:.3f}bb（`DecisionScore.gap`）"
+        )
+    ratio = report.signal_to_noise
+    if ratio is None:
+        lines.append("  排行可信度：**判不了**（两路残差都没量到）")
+        return lines
+    lines.append(
+        f"  噪声底 {report.noise_floor:.3f}bb/点，平均每点漏损 {report.mean_loss:.3f}bb，"
+        f"信噪比 {ratio:.1f}"
+    )
+    if report.ranking_trustworthy():
+        lines.append("  排行可信度：够用（漏损明显大过解自己的残差）")
+    else:
+        lines.append(
+            "  排行可信度：**不够**——漏损跟解的残差一个量级，"
+            "排在前面的多半只是「这格出现得多」。加 `--iterations` 重跑再看排行"
+        )
+    return lines
 
 
 def main() -> int:
@@ -203,12 +280,18 @@ def main() -> int:
 
     print(f"求解 {len(sample)} 个局面（这一步是唯一贵的）…", flush=True)
     started = time.perf_counter()
-    results = solve_and_score(
+    results, exploitability = solve_and_score(
         sample, solver, timeout=args.timeout, keep_cache=args.keep_cache
     )
     elapsed = time.perf_counter() - started
 
-    report = build_report(results, hands=len(sample), uncovered=uncovered)
+    report = build_report(
+        results,
+        hands=len(sample),
+        uncovered=uncovered,
+        exploitability=exploitability,
+        accuracy=args.accuracy,
+    )
     print()
     print(render(report, plan_count=len(plans), dealt=len(hands)))
     print()
@@ -223,6 +306,7 @@ def main() -> int:
                     "scored_spots": report.scored_spots,
                     "coverage": report.coverage,
                     "total_loss_bb": report.total_loss,
+                    "convergence": _convergence_json(report),
                     "leaks": [
                         {
                             "scenario": leak.scenario.title,

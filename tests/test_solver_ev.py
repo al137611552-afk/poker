@@ -326,8 +326,11 @@ def test_cross_street_ev_on_a_real_solve():
     report = solver.solve(request)
     spot = Spot.from_request(request)
 
+    # **标签是树里的原始键（求解器单位），`amount` 才是大盲**：命令文件用 1/10 大盲
+    # （`SolveRequest.scale`），所以 3.0bb 的那一注在树里叫 `BET 30.000000`。
+    # 生产路径不受影响——`review._match` 按「动作类型 + 大盲金额」找，再取它的 label。
     score = score_decision(
-        spot, report.root, line=("BET 3.000000",), hero=1, hero_cards=hand("AhAc")
+        spot, report.root, line=("BET 30.000000",), hero=1, hero_cards=hand("AhAc")
     )
     assert score.evs["FOLD"] == pytest.approx(0.0, abs=1e-9)
     assert score.best == "CALL", "AA 面对小注该跟——对手范围里一半是他打得过的"
