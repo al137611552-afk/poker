@@ -201,6 +201,87 @@ class TexasSolver:
         self._write_cache(fingerprint, request, report, document, commands)
         return report
 
+    @staticmethod
+    def supports_evs(home: "str | Path | None" = None) -> bool:
+        """这个二进制认不认 `dump_evs`。
+
+        官方预编译包**不认**——那条命令是我们自己打的补丁（ADR-0006、
+        `docs/solver-build/0001-dump-evs.patch`）。不查这一条，用预编译包跑
+        EV 相关的东西会红成一片，而真正的原因（"你这个二进制里根本没这个命令"）
+        埋在求解器日志的一行 `command not recognized` 里。
+
+        判据是在二进制里找命令名本身：比真跑一次求解便宜几个数量级，
+        且不依赖求解器的报错文案（那是上游的，随时会变）。
+        """
+        try:
+            binary = _binary_in(find_solver_home(home))
+        except Exception:
+            return False
+        if binary is None:
+            return False
+        try:
+            return b"dump_evs" in binary.read_bytes()
+        except OSError:
+            return False
+
+    def solve_evs(
+        self,
+        request: SolveRequest,
+        line: "tuple[str, ...]",
+        player: int,
+        *,
+        timeout: float = 3600.0,
+    ) -> "dict[str, dict[str, float]]":
+        """解一次，然后**直接向求解器要 EV**（`dump_evs`，见 ADR-0006）。
+
+        返回 `{手牌: {动作标签: EV}}`，金额是大盲，动作标签与 `dump_result` 里的一致。
+
+        两件必须说清的事：
+
+        1. **`player` 用我们的编号**（0 = OOP、1 = IP），这里翻译成求解器的编号再传。
+           求解器管 OOP 叫 1、IP 叫 0，取错一侧的解看着仍然「像那么回事」。
+        2. **EV 是求解器口径**：`最终底池份额 − 从这个局面起的投入 − 自己已投进底池的份额`。
+           要换成我们 `evaluate.py` 的口径，得**加回该节点上自己已投入的那部分**。
+           实测对上了手算（三个局面五个数，零误差，见 ADR-0006）——
+           口径不翻译就用，每个数都会差自己已投的那一截，而且看着完全合理。
+
+        `line` 里的动作标签直接来自 dump，含空格（`"BET 30.000000"`），
+        所以命令里用 `|` 分隔，不是空格。
+        """
+        solver_player = 1 - player          # 我们的 0/1 → 求解器的 1/0
+        with tempfile.TemporaryDirectory(prefix="holdem-evs-") as workspace:
+            work = Path(workspace)
+            evs_path = work / "evs.json"
+            commands = request.commands(str(work / "unused.json"), threads=self.threads)
+            # 换掉 dump_result：这一趟要的是 EV，不是策略树
+            body = [ln for ln in commands.splitlines() if not ln.startswith("dump_result")]
+            body.append(f"dump_evs {evs_path} {solver_player} {'|'.join(line)}".rstrip())
+            script = work / "input.txt"
+            script.write_text("\n".join(body) + "\n", encoding="utf-8")
+
+            process = subprocess.run(
+                [
+                    str(self.binary),
+                    "--input_file", str(script),
+                    "--resource_dir", str(self.home / "resources"),
+                    "--mode", "holdem",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.home),
+            )
+            if process.returncode != 0 or not evs_path.exists():
+                raise SolveFailed(_explain(process.returncode,
+                                           (process.stdout or "") + (process.stderr or "")))
+            document = json.loads(evs_path.read_text(encoding="utf-8"))
+
+        actions = document["actions"]
+        return {
+            hand: {actions[i]: value / request.scale for i, value in enumerate(row)}
+            for hand, row in document["evs"].items()
+        }
+
     # ---------------------------------------------------------- 缓存
 
     def _cache_path(self, fingerprint: str) -> Path:

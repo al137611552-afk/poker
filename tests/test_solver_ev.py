@@ -20,7 +20,9 @@ import pytest
 
 from holdem.cards import card_from_str, cards_from_str
 from holdem.ranges import Range, class_combos
+from holdem_solver.backend import TexasSolver
 from holdem_solver.evaluate import Spot, hand_ev, score_decision
+from holdem_solver.request import SolveRequest
 from holdem_solver.result import SolvedAction, SolvedNode, parse_result
 
 RIVER = Path(__file__).parent / "data" / "texassolver_river.json"
@@ -338,3 +340,56 @@ def test_cross_street_ev_on_a_real_solve():
     assert 0.0 <= score.gap <= budget + 1e-9, (
         f"解的自证差 {score.gap:.4f}bb 超过了求解器自己报的可利用度 {budget:.4f}bb"
     )
+
+
+# ------------------------------------------------------------------ 直接问求解器要 EV（慢）
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not TexasSolver.supports_evs(),
+                    reason="求解器不认 dump_evs（要按 docs/solver-build 自己编，官方预编译包没有）")
+def test_solver_evs_match_the_hand_computed_spot(tmp_path):
+    """`dump_evs`（ADR-0006 的自建补丁）吐出来的 EV 必须对上纸笔。
+
+    局面还是那个「结果完全确定」的河牌：OOP 全是暗三条、IP 全是一对，IP 一手都赢不了。
+    底池 6、有效筹码 9，双方各已投 3。于是每个数都能手算：
+
+    | 谁 · 在哪 | 求解器口径 | 加回自己已投的 3 | 手算 |
+    |---|---|---|---|
+    | OOP 在根（必赢底池） | +3 | 6 | 赢下整个底池 |
+    | IP 在根（必输、还没再投） | −3 | 0 | 一分不亏地弃掉 |
+    | IP 面对全下 · FOLD | −3 | 0 | 同上 |
+    | IP 面对全下 · CALL | −12 | −9 | 白扔九个大盲 |
+
+    **口径差就是「自己已投进底池的那一份」**，不是可调的系数。不翻译直接用，
+    每个数都会差这一截，而且看上去完全合理——这正是 ADR-0006 立的规矩：
+    先拿硬基准对账，对不上别调系数糊过去。
+    """
+    solver = TexasSolver(cache_dir=tmp_path / "cache", threads=2)
+    request = SolveRequest(
+        board=BOARD,
+        pot=POT,
+        effective_stack=9.0,
+        oop_range=Range.parse("QQ, 77, 22"),
+        ip_range=Range.parse("AA, KK, AKo"),
+        accuracy=0.1,
+        max_iterations=200,
+    )
+    own_commit = POT / 2          # 双方各投了半个底池
+
+    at_root_oop = solver.solve_evs(request, (), player=0)
+    for hand, evs in at_root_oop.items():
+        for label, ev in evs.items():
+            assert ev + own_commit == pytest.approx(POT, abs=1e-6), (hand, label)
+
+    at_root_ip = solver.solve_evs(request, (), player=1)
+    for hand, evs in at_root_ip.items():
+        for label, ev in evs.items():
+            assert ev + own_commit == pytest.approx(0.0, abs=1e-6), (hand, label)
+
+    # 找到 OOP 的全下标签（金额由求解器取整决定，别写死）
+    bet = next(l for l in next(iter(at_root_oop.values())) if l.startswith("BET"))
+    facing = solver.solve_evs(request, (bet,), player=1)
+    for hand, evs in facing.items():
+        assert evs["FOLD"] + own_commit == pytest.approx(0.0, abs=1e-6), hand
+        assert evs["CALL"] + own_commit == pytest.approx(-9.0, abs=1e-6), hand

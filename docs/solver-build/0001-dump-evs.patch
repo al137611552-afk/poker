@@ -1,0 +1,306 @@
+--- a/include/solver/BestResponse.h	2026-07-13 19:06:22.000000000 +0900
++++ b/include/solver/BestResponse.h	2026-08-21 16:16:14.215613893 +0900
+@@ -16,6 +16,7 @@
+ #include <nodes/TerminalNode.h>
+ #include <nodes/ShowdownNode.h>
+ #include <tools/utils.h>
++#include "json.hpp"
+ 
+ using namespace std;
+ 
+@@ -46,7 +47,33 @@
+     float printExploitability(shared_ptr<GameTreeNode> root, int iterationCount, float initial_pot, uint64_t initialBoard);
+     float getBestReponseEv(shared_ptr<GameTreeNode> node, int player,vector<vector<float>> reach_probs, uint64_t initialBoard,int deal);
+ 
++    // ---- holdem-trainer patch: per-action EV at a given line -----------------
++    // Walks `line` (action labels as produced by GameActions::toString, the same
++    // strings that appear in dump_result) down from `root`, then returns, for the
++    // node reached, the EV of every available action for every one of `player`'s
++    // hands.
++    //
++    // The traversal runs in *expected-value* mode, NOT best-response mode: at the
++    // player's own decision nodes the children are averaged under the solved
++    // average strategy instead of taking the max. That matters -- best response
++    // answers "what if I switch to exploiting", while review scoring asks "what is
++    // this action worth if I keep playing the solution afterwards". Mixing the two
++    // silently inflates every EV by the exploitability.
++    //
++    // Reach probs are built here from private_combos rather than taken from the
++    // caller: PCfrSolver::getReachProbs() indexes hands by its own range vectors,
++    // which are NOT the same ordering as the combos this class holds. Reading one
++    // with the other's index is an out-of-bounds read that produces plausible
++    // numbers instead of a crash -- it silently zeroed every EV once already.
++    // printExploitability builds its reach the same way, from private_combos.
++    nlohmann::json evsAtLine(shared_ptr<GameTreeNode> root, int player,
++                             uint64_t initialBoard, const vector<string>& line);
++
+ private:
++    // holdem-trainer patch: average children under the solved strategy at the
++    // player's own nodes instead of taking the max (see evsAtLine).
++    bool ev_mode = false;
++
+     vector<float> bestResponse(shared_ptr<GameTreeNode> node, int player, const vector<vector<float>>& reach_probs, uint64_t board,int deal);
+     vector<float> chanceBestReponse(shared_ptr<ChanceNode> node, int player, const vector<vector<float>>& reach_probs, uint64_t current_board,int deal);
+     vector<float> actionBestResponse(shared_ptr<ActionNode> node, int player, const vector<vector<float>>& reach_probs, uint64_t board,int deal);
+--- a/src/solver/BestResponse.cpp	2026-07-13 19:06:22.000000000 +0900
++++ b/src/solver/BestResponse.cpp	2026-08-21 16:16:14.215613893 +0900
+@@ -226,7 +226,33 @@
+ vector<float>
+ BestResponse::actionBestResponse(shared_ptr<ActionNode> node, int player, const vector<vector<float>>& reach_probs,
+                                  uint64_t board, int deal) {
+-    if(player == node->getPlayer()){
++    if(player == node->getPlayer() && this->ev_mode){
++        // holdem-trainer patch: expected-value mode.
++        //
++        // Best response takes max over the player's own actions -- that answers
++        // "what if I switch to exploiting from here". Review scoring needs the
++        // other question: "what is this worth if I keep playing the solution",
++        // so average the children under the solved average strategy instead.
++        //
++        // Reach probs are passed through unchanged, exactly as the max branch
++        // below does: a player's own reach never enters their own payoff (each
++        // hand is priced independently against the opponent's reach), and the
++        // CFR traversal makes the same choice (see PCfrSolver::cfr, which only
++        // rescales reach when node_player != player).
++        shared_ptr<Trainable> trainable = node->getTrainable(deal);
++        if(trainable == nullptr) throw runtime_error("evsAtLine: null trainable");
++        const vector<float>& node_strategy = trainable->getAverageStrategy();
++        int n = reach_probs[player].size();
++        vector<float> weighted = vector<float>(n, 0.0f);
++        for(int action_ind = 0;action_ind < node->getChildrens().size();action_ind ++){
++            const vector<float>& child_ev =
++                    this->bestResponse(node->getChildrens()[action_ind],player,reach_probs,board,deal);
++            if(child_ev.empty()) continue;
++            for(int i = 0;i < n;i ++)
++                weighted[i] += node_strategy[action_ind * n + i] * child_ev[i];
++        }
++        return weighted;
++    }else if(player == node->getPlayer()){
+         // 如果是自己在做决定，那么肯定选对自己的最有利的，反之对于对方来说，这个就是我方expliot了对方,
+         // 这里可以当成"player"做决定的时候，action prob是0-1分布，因为需要使用最好的策略去expliot对方，最好的策略一定是ont-hot的
+         vector<float> my_exploitability = vector<float>(reach_probs[player].size());
+@@ -458,3 +484,110 @@
+     return payoffs;
+ }
+ 
++// ---- holdem-trainer patch -----------------------------------------------------
++// Per-action EV at a given line. See BestResponse.h for why this runs in
++// expected-value mode rather than best-response mode.
++nlohmann::json BestResponse::evsAtLine(shared_ptr<GameTreeNode> root, int player,
++                                       uint64_t initialBoard, const vector<string>& line) {
++    // Build reach from our own combos so every index below refers to the same list.
++    vector<vector<float>> reach_probs(this->player_number);
++    for(int p = 0;p < this->player_number;p ++) {
++        reach_probs[p] = vector<float>(this->private_combos[p].size());
++        for(int i = 0;i < this->private_combos[p].size();i ++)
++            reach_probs[p][i] = this->private_combos[p][i].weight;
++    }
++
++    shared_ptr<GameTreeNode> node = root;
++
++    // Walk the line, rescaling reach probs by the strategy actually taken at each
++    // step. Only the acting player's reach is rescaled -- the other player's hands
++    // are still all live -- which is the same rule the traversal above uses.
++    for(const string& want : line) {
++        if(node->getType() != GameTreeNode::GameTreeNodeType::ACTION)
++            throw runtime_error(fmt::format("evsAtLine: expected an action node before '{}'", want));
++        shared_ptr<ActionNode> action_node = std::dynamic_pointer_cast<ActionNode>(node);
++
++        int taken = -1;
++        vector<string> labels;
++        for(int i = 0;i < action_node->getActions().size();i ++) {
++            string label = action_node->getActions()[i].toString();
++            labels.push_back(label);
++            if(label == want) taken = i;
++        }
++        if(taken < 0) {
++            string avail;
++            for(const string& l : labels) avail += (avail.empty() ? "" : ", ") + l;
++            throw runtime_error(fmt::format("evsAtLine: action '{}' not at this node (have: {})", want, avail));
++        }
++
++        int acting = action_node->getPlayer();
++        shared_ptr<Trainable> trainable = action_node->getTrainable(0);
++        if(trainable == nullptr) throw runtime_error("evsAtLine: null trainable while walking the line");
++        const vector<float>& node_strategy = trainable->getAverageStrategy();
++        int n = reach_probs[acting].size();
++        for(int i = 0;i < n;i ++)
++            reach_probs[acting][i] *= node_strategy[taken * n + i];
++
++        node = action_node->getChildrens()[taken];
++    }
++
++    if(node->getType() != GameTreeNode::GameTreeNodeType::ACTION)
++        throw runtime_error("evsAtLine: the line does not end on a decision node");
++    shared_ptr<ActionNode> target = std::dynamic_pointer_cast<ActionNode>(node);
++
++    this->ev_mode = true;
++    vector<string> labels;
++    vector<vector<float>> per_action;
++    for(int i = 0;i < target->getActions().size();i ++) {
++        labels.push_back(target->getActions()[i].toString());
++        per_action.push_back(
++                this->bestResponse(target->getChildrens()[i], player, reach_probs, initialBoard, 0));
++    }
++    this->ev_mode = false;
++
++    nlohmann::json out;
++    out["player"] = player;
++    out["node_player"] = target->getPlayer();
++    out["actions"] = labels;
++    // EVs are keyed by hand so the caller never has to guess at combo ordering --
++    // that ordering is an internal detail of the range converter and has bitten us
++    // before. Weight is carried along because a range can be fractional.
++    nlohmann::json evs = nlohmann::json::object();
++    vector<PrivateCards>& combos = this->private_combos[player];
++    vector<PrivateCards>& oppo_combos = this->private_combos[1 - player];
++    for(int h = 0;h < combos.size();h ++) {
++        uint64_t private_long = combos[h].toBoardLong();
++        // Hands that collide with the board are not real hands here.
++        if(Card::boardsHasIntercept(private_long,initialBoard)) continue;
++
++        // The traversal returns payoffs summed over the opponent's reach, so a
++        // single hand's EV is that sum divided by how much opponent range it was
++        // summed against -- the same normalisation getBestReponseEv applies before
++        // reporting exploitability. Without it every number comes out scaled by the
++        // size of the opponent's range, which looks plausible and is simply wrong.
++        //
++        // Divide by the *reach* at this node, not by the raw combo weights.
++        // getBestReponseEv can use the weights because it always starts at the root
++        // where the two are equal; here the line has already rescaled the opponent's
++        // reach by the strategy they took to get here, so weights would over-divide
++        // by exactly the frequency of that line. A root-only check cannot catch
++        // this -- it took a spot one action deep, where the numbers came out at
++        // precisely half of hand-computed truth.
++        const vector<float>& oppo_reach = reach_probs[1 - player];
++        float oppo_sum = 0;
++        for(int o = 0;o < oppo_combos.size();o ++) {
++            uint64_t oppo_long = oppo_combos[o].toBoardLong();
++            if(Card::boardsHasIntercept(private_long,oppo_long)
++               || Card::boardsHasIntercept(oppo_long,initialBoard)) continue;
++            oppo_sum += oppo_reach[o];
++        }
++        if(oppo_sum <= 0) continue;   // nothing left for this hand to play against
++
++        nlohmann::json row = nlohmann::json::array();
++        for(int a = 0;a < per_action.size();a ++)
++            row.push_back(per_action[a].empty() ? 0.0f : per_action[a][h] / oppo_sum);
++        evs[combos[h].toString()] = row;
++    }
++    out["evs"] = evs;
++    return out;
++}
+--- a/include/solver/PCfrSolver.h	2026-07-13 19:06:22.000000000 +0900
++++ b/include/solver/PCfrSolver.h	2026-08-21 16:07:50.989224108 +0900
+@@ -92,6 +92,8 @@
+     );
+     void train() override;
+     json dumps(bool with_status,int depth);
++    // holdem-trainer patch: per-action EV at a line (see BestResponse::evsAtLine)
++    json dumpEvs(const vector<string>& line, int player);
+ private:
+     vector<vector<PrivateCards>> ranges;
+     vector<PrivateCards> range1;
+--- a/src/solver/PCfrSolver.cpp	2026-07-13 19:06:22.000000000 +0900
++++ b/src/solver/PCfrSolver.cpp	2026-08-21 16:16:14.216613880 +0900
+@@ -966,3 +966,14 @@
+     return std::move(retjson);
+ }
+ 
++// ---- holdem-trainer patch -----------------------------------------------------
++json PCfrSolver::dumpEvs(const vector<string>& line, int player) {
++    vector<vector<PrivateCards>> player_privates(this->player_number);
++    player_privates[0] = this->pcm.getPreflopCards(0);
++    player_privates[1] = this->pcm.getPreflopCards(1);
++
++    BestResponse br = BestResponse(player_privates,this->player_number,this->pcm,this->rrm,
++                                   this->deck,this->debug,this->color_iso_offset,
++                                   this->split_round,this->num_threads);
++    return br.evsAtLine(this->tree->getRoot(), player, this->initial_board_long, line);
++}
+--- a/include/runtime/PokerSolver.h	2026-07-13 19:06:22.000000000 +0900
++++ b/include/runtime/PokerSolver.h	2026-08-21 16:07:55.904159641 +0900
+@@ -44,6 +44,8 @@
+             int threads
+             );
+     void dump_strategy(string dump_file,int dump_rounds);
++    // holdem-trainer patch: per-action EV at a line, written as json
++    void dump_evs(string dump_file,const vector<string>& line,int player);
+ private:
+     shared_ptr<Dic5Compairer> compairer;
+     Deck deck;
+--- a/src/runtime/PokerSolver.cpp	2026-07-13 19:06:22.000000000 +0900
++++ b/src/runtime/PokerSolver.cpp	2026-08-21 16:08:08.883989390 +0900
+@@ -103,6 +103,22 @@
+     fileWriter.close();
+ }
+ 
++// ---- holdem-trainer patch -----------------------------------------------------
++void PokerSolver::dump_evs(string dump_file,const vector<string>& line,int player) {
++    if(this->solver == nullptr) throw runtime_error("dump_evs: nothing solved yet");
++    // dynamic_cast rather than a virtual on Solver: the EV traversal is specific
++    // to the parallel CFR solver's data, and widening the base interface for one
++    // downstream tool is exactly the kind of upstream churn the patch should avoid.
++    PCfrSolver* pcfr = dynamic_cast<PCfrSolver*>(this->solver.get());
++    if(pcfr == nullptr) throw runtime_error("dump_evs: only supported for the parallel cfr solver");
++    json dump_json = pcfr->dumpEvs(line, player);
++    ofstream fileWriter;
++    fileWriter.open(dump_file);
++    fileWriter << dump_json;
++    fileWriter.flush();
++    fileWriter.close();
++}
++
+ const shared_ptr<GameTree> &PokerSolver::getGameTree() const {
+     return game_tree;
+ }
+--- a/src/tools/CommandLineTool.cpp	2026-07-13 19:06:22.000000000 +0900
++++ b/src/tools/CommandLineTool.cpp	2026-08-21 16:09:00.358314226 +0900
+@@ -91,9 +91,17 @@
+     vector<string> contents;
+     split(input,' ',contents);
+     if(contents.size() == 0) contents = {input};
+-    if(contents.size() > 2 || contents.size() < 1)throw runtime_error(fmt::format("command not valid: {}",input));
++    if(contents.size() < 1)throw runtime_error(fmt::format("command not valid: {}",input));
+     string command = contents[0];
+-    string paramstr = contents.size() == 1 ? "" : contents[1];
++    // holdem-trainer patch: keep everything after the first space as the parameter
++    // rather than rejecting it. Upstream split() breaks on *every* space and then
++    // refuses more than two tokens, so a command whose argument contains a space --
++    // an action label is literally "BET 3.000000" -- could not be expressed at all.
++    // No existing command takes a multi-token argument, so this only widens what is
++    // accepted; every previously valid line still parses to the same two pieces.
++    string paramstr = "";
++    string::size_type first_space = input.find(' ');
++    if(first_space != string::npos) paramstr = input.substr(first_space + 1);
+     if(command == "set_pot"){
+         this->ip_commit = stof(paramstr) / 2;
+         this->oop_commit = stof(paramstr) / 2;
+@@ -169,6 +177,27 @@
+     }else if(command == "dump_result"){
+         string output_file = paramstr;
+         this->ps.dump_strategy(output_file,this->dump_rounds);
++    }else if(command == "dump_evs"){
++        // holdem-trainer patch:
++        //   dump_evs <file> <player> [action1|action2|...]
++        // Player is 0 (oop) or 1 (ip); the third field is the line, '|'-separated,
++        // using the very same action labels dump_result writes. Empty line = root.
++        // The line is '|'-separated, not space-separated, because an action label
++        // contains a space ("BET 3.000000"). Only the first two fields are split on
++        // spaces; everything after them is the line.
++        string::size_type s1 = paramstr.find(' ');
++        if(s1 == string::npos)
++            throw runtime_error("dump_evs needs: <file> <player> [a1|a2|...]");
++        string output_file = paramstr.substr(0, s1);
++        string rest = paramstr.substr(s1 + 1);
++        string::size_type s2 = rest.find(' ');
++        int player = stoi(s2 == string::npos ? rest : rest.substr(0, s2));
++        vector<string> line;
++        if(s2 != string::npos) {
++            string line_str = rest.substr(s2 + 1);
++            if(!line_str.empty()) line = string_split(line_str,'|');
++        }
++        this->ps.dump_evs(output_file,line,player);
+     }else if(command == "set_dump_rounds"){
+         this->dump_rounds = stoi(paramstr);
+     }else{
