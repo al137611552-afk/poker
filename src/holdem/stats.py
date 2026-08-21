@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from .history import action_records
 from .state import PREFLOP
 
-__all__ = ["Chance", "StatLine", "accumulate", "hand_stats"]
+__all__ = ["Chance", "HandFacts", "StatLine", "accumulate", "accumulate_facts", "hand_stats"]
 
 
 @dataclass
@@ -125,6 +125,22 @@ _CHANCE_FIELDS = (
 _FLOP = PREFLOP + 1
 
 
+@dataclass(frozen=True)
+class HandFacts:
+    """算统计要用的、**动作序列之外**的那点事实。
+
+    单独立出来是为了让口径只有一份：一手牌可以来自内存里的 `HandState`，
+    也可以来自数据库里存好的行，两条路都折成 `(记录序列, HandFacts)` 之后
+    走**同一个** `accumulate_facts`。两份实现各算各的，是统计口径漂移的头号原因。
+    """
+
+    num_seats: int
+    saw_flop: bool
+    showdown_seats: "frozenset[int]"
+    net: "dict[int, int]"
+    """座位 → 这手牌的净盈亏。只用来判摊牌赢没赢。"""
+
+
 def hand_stats(hand) -> "dict[int, StatLine]":
     """一手牌 → 每个座位的统计。纯逻辑，不碰 IO。"""
     into: dict[int, StatLine] = {}
@@ -132,31 +148,49 @@ def hand_stats(hand) -> "dict[int, StatLine]":
     return into
 
 
-def accumulate(hand, into: "dict[int, StatLine]", *, by_position: bool = False) -> None:
-    """把一手牌折进 `into`。`by_position=True` 时按 `(座位, 位置)` 分组。
-
-    位置取**翻前**那条记录上的（`ActionRecord.position`）——一手牌里位置不会变，
-    但只有翻前每个人必然有记录，翻后弃了牌的人就没有了。
-    """
+def accumulate(hand, into: "dict", *, by_position: bool = False, key_of=None) -> None:
+    """把一手 `HandState` 折进 `into`。"""
     if hand.result is None:
         # **说不了就说不了**：没打完的牌算不出摊牌类指标，硬算会把「还没到摊牌」
         # 记成「没走到摊牌」，WTSD 会被系统性地压低。宁可让调用方看见这句话。
         raise ValueError("这手牌还没打完，统计不了（`hand.result` 是 None）")
 
-    records = action_records(hand)
-    seats = hand.config.num_seats
+    facts = HandFacts(
+        num_seats=hand.config.num_seats,
+        saw_flop=len(hand.board) >= 3,
+        showdown_seats=frozenset(hand.result.showdown_scores),
+        net={seat: value for seat, value in enumerate(hand.result.net)},
+    )
+    accumulate_facts(action_records(hand), facts, into,
+                     by_position=by_position, key_of=key_of)
+
+
+def accumulate_facts(records, facts: HandFacts, into: "dict", *,
+                     by_position: bool = False, key_of=None) -> None:
+    """把一手牌折进 `into`。**这是唯一一处定义口径的地方。**
+
+    - `key_of(seat)` 决定统计按什么归集：默认按座位；从数据库算时传玩家名
+      （HUD 要的是「这个对手」，跨局跨座位）。
+    - `by_position=True` 时键变成 `(key, 位置)`。位置取**翻前**那条记录上的
+      ——一手牌里位置不会变，但只有翻前每个人必然有记录，翻后弃了牌的人就没有了。
+    """
+    records = list(records)
+    seats = facts.num_seats
     positions = _positions(records, seats)
+    identify = key_of or (lambda seat: seat)
 
     def line(seat: int) -> StatLine:
-        key = (seat, positions.get(seat)) if by_position else seat
+        key = identify(seat)
+        if by_position:
+            key = (key, positions.get(seat))
         return into.setdefault(key, StatLine())
 
     pre = _preflop_pass(records, seats)
     post = _flop_pass(records, seats, pre.last_raiser)
 
-    saw_flop = len(hand.board) >= 3
-    showdown_seats = hand.result.showdown_scores
-    net = hand.result.net
+    saw_flop = facts.saw_flop
+    showdown_seats = facts.showdown_seats
+    net = facts.net
 
     for seat in range(seats):
         stats = line(seat)

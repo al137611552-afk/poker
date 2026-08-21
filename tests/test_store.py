@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from holdem.actions import call, check, fold, raise_to
+from holdem.actions import bet, call, check, fold, raise_to
 from holdem.deck import deck_from_seed, stacked_deck
 from holdem.phh import loads, phh_player_order
 from holdem.state import HandConfig, HandState
@@ -195,3 +195,90 @@ def test_deleting_a_hand_cascades(store):
             f"SELECT COUNT(*) AS c FROM {table} WHERE hand_id = ?", (hand_id,)
         ).fetchone()
         assert row["c"] == 0, f"{table} 未随牌局一起删除"
+
+
+# ------------------------------------------------------------------ 从库里算统计（FR-7）
+
+
+def _finish(hand):
+    while not hand.is_complete:
+        hand.apply(check() if hand.legal_actions().can_check else fold())
+
+
+def test_stats_from_the_database_match_the_ones_computed_in_memory(store):
+    """**同一手牌，走内存和走数据库必须得出一模一样的统计。**
+
+    这条是整次解耦的意义所在：口径只在 `stats.py` 定义一次，
+    两条来源只负责把牌折成同样的 `(记录序列, HandFacts)`。
+    一旦有人在 store 这边"顺手"重算某个指标，这条就会红。
+    """
+    from holdem.stats import accumulate
+
+    session = store.create_session("统计", small_blind=5, big_blind=10)
+    hands = []
+    for actions in (
+        [raise_to(30), fold(), fold(), fold(), fold(), fold()],
+        [call(), raise_to(40), fold(), fold(), fold(), fold(), fold()],
+        [raise_to(30), fold(), fold(), fold(), fold(), call(), check(), bet(40), fold()],
+    ):
+        hand = _play([1000] * 6, button=0, actions=actions)
+        _finish(hand)
+        store.save_hand(hand, session_id=session, players=SIX_MAX)
+        hands.append(hand)
+
+    in_memory = {}
+    for hand in hands:
+        accumulate(hand, in_memory, key_of=lambda seat: SIX_MAX[seat])
+    from_db = store.player_stats(session_id=session)
+
+    assert set(from_db) == set(in_memory), "两条路统计到的人得是同一批"
+    for name, line in in_memory.items():
+        other = from_db[name]
+        assert other.hands == line.hands, name
+        for field in ("vpip", "pfr", "rfi", "threebet", "fold_to_threebet",
+                      "cbet_flop", "fold_to_cbet_flop", "wtsd", "wsd"):
+            mine, theirs = getattr(line, field), getattr(other, field)
+            assert (theirs.chances, theirs.hits) == (mine.chances, mine.hits), (name, field)
+        assert other.postflop_aggressive == line.postflop_aggressive, name
+        assert other.postflop_calls == line.postflop_calls, name
+
+
+def test_stats_are_keyed_by_player_not_by_seat(store):
+    """HUD 问的是「这个对手怎么打」，而同一个人跨局会换座位。"""
+    session = store.create_session("换座", small_blind=5, big_blind=10)
+    hand = _play([1000] * 6, button=0, actions=[raise_to(30)] + [fold()] * 5)
+    _finish(hand)
+    store.save_hand(hand, session_id=session, players=SIX_MAX)
+
+    # 同一批人，按钮挪一位：座位与位置的对应关系整个变了
+    hand2 = _play([1000] * 6, button=1, actions=[raise_to(30)] + [fold()] * 5)
+    _finish(hand2)
+    store.save_hand(hand2, session_id=session, players=SIX_MAX)
+
+    stats = store.player_stats(session_id=session)
+    assert set(stats) == set(SIX_MAX)
+    assert all(line.hands == 2 for line in stats.values()), "每个人都打了两手"
+
+
+def test_filtering_by_player_still_feeds_the_whole_hand_to_the_algorithm(store):
+    """只要一个人的数，也得把整手牌喂进去——3bet 的**分母**得知道别人加没加注。"""
+    session = store.create_session("过滤", small_blind=5, big_blind=10)
+    hand = _play([1000] * 6, button=0,
+                 actions=[raise_to(30), raise_to(90), fold(), fold(), fold(), fold(), fold()])
+    _finish(hand)
+    store.save_hand(hand, session_id=session, players=SIX_MAX)
+
+    only = store.player_stats(session_id=session, players=("bot4",))
+    assert set(only) == {"bot4"}
+    assert only["bot4"].threebet.chances == 1 and only["bot4"].threebet.hits == 1
+
+
+def test_stats_can_be_split_by_position(store):
+    session = store.create_session("位置", small_blind=5, big_blind=10)
+    hand = _play([1000] * 6, button=0, actions=[raise_to(30)] + [fold()] * 5)
+    _finish(hand)
+    store.save_hand(hand, session_id=session, players=SIX_MAX)
+
+    stats = store.player_stats(session_id=session, by_position=True)
+    assert ("bot3", "UTG") in stats
+    assert stats[("bot3", "UTG")].rfi.hits == 1

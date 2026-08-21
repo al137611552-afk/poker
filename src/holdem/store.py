@@ -16,11 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .cards import cards_to_str
-from .history import action_records
+from .cards import cards_from_str, cards_to_str
+from .history import ActionRecord, action_records
 from .phh import to_phh
 from .positions import position_of
 from .metrics import bb_per_100
+from .stats import HandFacts, accumulate_facts
 from .state import HandState
 
 SCHEMA_VERSION = 1
@@ -307,6 +308,90 @@ class HandStore:
             big_blind=int(row["big_blind"]),
         )
 
+    def player_stats(
+        self, *, session_id: "int | None" = None, players: "tuple[str, ...] | None" = None,
+        by_position: bool = False,
+    ) -> "dict":
+        """从**已落库的牌**算 PT4 口径的统计（FR-7；FR-8 的 HUD 就靠它）。
+
+        按**玩家名**归集，不是按座位——HUD 问的是「这个对手怎么打」，
+        而同一个人跨局会换座位。
+
+        口径来自 `stats.py`，**这里一行都不重算**：数据库那条路与内存那条路
+        折成同样的 `(记录序列, HandFacts)` 之后走同一个函数。两份实现各算各的，
+        是统计口径漂移的头号原因（`batch.py` 那份已经在排队合并了）。
+
+        `players` 给了就只统计这几个人**在他们参与的那些手牌里**的表现——
+        注意仍要把整手牌喂进算法：3bet 的分母得知道别人加没加注。
+        """
+        facts_by_hand, records_by_hand, seat_names = self._hand_material(session_id)
+        into: dict = {}
+        wanted = set(players) if players else None
+
+        for hand_id, facts in facts_by_hand.items():
+            names = seat_names[hand_id]
+            if wanted is not None and not (wanted & set(names.values())):
+                continue
+
+            def key_of(seat: int, _names=names) -> str:
+                return _names.get(seat, f"seat{seat}")
+
+            accumulate_facts(records_by_hand.get(hand_id, ()), facts, into,
+                             by_position=by_position, key_of=key_of)
+
+        if wanted is None:
+            return into
+        return {
+            key: line for key, line in into.items()
+            if (key[0] if by_position else key) in wanted
+        }
+
+    def _hand_material(self, session_id: "int | None"):
+        """把一批牌读成算统计要的三样：每手的事实、动作记录、座位→玩家名。"""
+        clause = "" if session_id is None else " WHERE h.session_id = :session"
+        params = {"session": session_id}
+
+        facts_rows = self.conn.execute(
+            "SELECT h.id, h.num_seats, h.board FROM hands h" + clause, params
+        ).fetchall()
+        players_rows = self.conn.execute(
+            "SELECT p.hand_id, p.seat, p.player, p.net, p.showed"
+            " FROM hand_players p JOIN hands h ON h.id = p.hand_id" + clause, params
+        ).fetchall()
+        action_rows = self.conn.execute(
+            "SELECT a.* FROM hand_actions a JOIN hands h ON h.id = a.hand_id"
+            + clause + " ORDER BY a.hand_id, a.seq", params
+        ).fetchall()
+
+        seat_names: dict = {}
+        nets: dict = {}
+        showdowns: dict = {}
+        for row in players_rows:
+            hand_id = int(row["hand_id"])
+            seat_names.setdefault(hand_id, {})[int(row["seat"])] = row["player"]
+            nets.setdefault(hand_id, {})[int(row["seat"])] = int(row["net"])
+            if int(row["showed"]):
+                showdowns.setdefault(hand_id, set()).add(int(row["seat"]))
+
+        facts = {}
+        for row in facts_rows:
+            hand_id = int(row["id"])
+            # 牌面是**连写**的（`Qs7h2c`），不是空格分隔——用现成的解析器，
+            # 别自己数字符：这里第一版就是 `.split()`，于是每手牌都被判成"没看到翻牌"，
+            # WTSD 的分母整个塌成 0（对账测试当场逮到）。
+            board = cards_from_str(row["board"] or "")
+            facts[hand_id] = HandFacts(
+                num_seats=int(row["num_seats"]),
+                saw_flop=len(board) >= 3,
+                showdown_seats=frozenset(showdowns.get(hand_id, ())),
+                net=nets.get(hand_id, {}),
+            )
+
+        records: dict = {}
+        for row in action_rows:
+            records.setdefault(int(row["hand_id"]), []).append(_record_from_row(row))
+        return facts, records, seat_names
+
     def close(self) -> None:
         self.conn.close()
 
@@ -315,3 +400,26 @@ class HandStore:
 
     def __exit__(self, *exc_info) -> None:
         self.close()
+
+
+def _record_from_row(row) -> ActionRecord:
+    """数据库行 → `ActionRecord`。
+
+    `is_voluntary` **不存在表里，也不需要**：它的定义就是 `kind in (call, bet, raise)`
+    （盲注根本不是一条动作记录）。存一份等于给同一个事实开第二个真相源。
+    """
+    return ActionRecord(
+        seq=int(row["seq"]),
+        street=int(row["street"]),
+        seat=int(row["seat"]),
+        position=row["position"],
+        kind=row["kind"],
+        amount=int(row["amount"]),
+        to=int(row["to_amount"]),
+        pot_before=int(row["pot_before"]),
+        bet_before=int(row["bet_before"]),
+        to_call=int(row["to_call"]),
+        stack_before=int(row["stack_before"]),
+        actors_before=int(row["actors_before"]),
+        is_voluntary=row["kind"] in ("call", "bet", "raise"),
+    )
