@@ -173,6 +173,31 @@
   .result .lose { color: var(--danger); }
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
+
+  /* ---- HUD（FR-8）---- */
+  .seat-hud { display: flex; gap: 7px; margin-top: 5px; font-family: var(--mono);
+    font-size: 10.5px; color: var(--muted); cursor: pointer; }
+  .seat-hud .m { display: flex; gap: 2px; }
+  .seat-hud .m b { font-weight: 600; color: var(--text); }
+  /* 样本不足＝**数字本身不可信**，用颜色说出来，而不是照常显示一个精确的百分比 */
+  .seat-hud .thin b { color: var(--muted); }
+  .seat-hud .none b { color: var(--muted); }
+  .hud-modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex;
+    align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+  .hud-modal[hidden] { display: none; }   /* 作者样式会盖掉 hidden 属性，必须补这条 */
+  .hud-card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; width: min(420px, 100%); max-height: 80vh; overflow-y: auto; }
+  .hud-card h3 { margin: 0 0 4px; font-size: 15px; }
+  .hud-sample { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .hud-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0;
+    border-top: 1px solid var(--line); }
+  .hud-row .label { min-width: 74px; font-size: 12.5px; }
+  .hud-row .value { font-family: var(--mono); font-size: 13px; font-weight: 600;
+    min-width: 56px; text-align: right; }
+  .hud-row .n { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .hud-row .hint { font-size: 11px; color: var(--muted); margin-left: auto; text-align: right; }
+  .hud-row.thin .value { color: var(--muted); }
+  .hud-close { margin-top: 12px; width: 100%; min-height: 44px; }  /* 触屏目标 ≥44px */
 </style>
 </head>
 <body>
@@ -266,6 +291,103 @@ function cardEl(text, small) {
   el.textContent = rank + SUITS[suit];
   if (suit === "h" || suit === "d") el.classList.add("red");
   return el;
+}
+
+
+// ---------------------------------------------------------------- HUD（FR-8）
+
+let hud = null;
+
+// 样本量门槛。**这两个数是拍的**，写在这儿而不是服务端，因为「够不够」取决于
+// 看哪个指标：VPIP 几十手就稳，3bet 要几百手。服务端给原始计数、前端决定怎么显示，
+// 这样想按指标细分门槛时不用改接口。
+const HUD_THIN = 20;   // 少于这么多次机会：数字置灰，别让人当真
+const HUD_NONE = 5;    // 少于这么多：直接显示「—」，一个百分比都不给
+
+function hudCell(metric) {
+  // rate 为 null＝**一次机会都没有过**，跟「有机会但 0%」是两件事，不能都画成 0%
+  if (metric.rate === null || metric.chances < HUD_NONE) return { text: "—", cls: "none" };
+  const text = Math.round(metric.rate * 100) + "%";
+  return { text, cls: metric.chances < HUD_THIN ? "thin" : "" };
+}
+
+function seatHud(seat) {
+  const row = document.createElement("div");
+  row.className = "seat-hud";
+  const line = hud && hud.seats ? hud.seats[seat.seat] : null;
+  if (!line) return row;
+
+  // 卡片上只放最常看的三项，其余进浮层——牌桌上的空间比信息更稀缺
+  const wanted = ["vpip", "pfr", "threebet"];
+  wanted.forEach((key) => {
+    const metric = line.stats.find((m) => m.key === key);
+    if (!metric) return;
+    const cell = hudCell(metric);
+    const box = document.createElement("span");
+    box.className = "m " + cell.cls;
+    box.innerHTML = metric.label + " <b>" + cell.text + "</b>";
+    row.appendChild(box);
+  });
+  row.title = "点开看完整统计（" + line.hands + " 手）";
+  row.addEventListener("click", (event) => { event.stopPropagation(); showHud(line); });
+  return row;
+}
+
+function showHud(line) {
+  const modal = $("hudModal");
+  const card = $("hudCard");
+  card.innerHTML = "";
+
+  const title = document.createElement("h3");
+  title.textContent = line.name;
+  const sample = document.createElement("div");
+  sample.className = "hud-sample";
+  // **样本量摆在最显眼处**：HUD 最大的坑就是拿几手牌的数字当真
+  sample.textContent = line.hands + " 手" + (line.hands < HUD_THIN ? "（样本还很少，数字仅供参考）" : "");
+  card.append(title, sample);
+
+  line.stats.forEach((metric) => {
+    const row = document.createElement("div");
+    row.className = "hud-row";
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = metric.label;
+    const value = document.createElement("span");
+    value.className = "value";
+    const n = document.createElement("span");
+    n.className = "n";
+
+    if (metric.key === "aggression_factor") {
+      // AF 不是比率，别拿百分比逻辑套它（服务端给的是 value + 两个计数）
+      value.textContent = metric.value === null ? "—" : metric.value.toFixed(2);
+      n.textContent = metric.aggressive + "/" + metric.calls;
+    } else {
+      const cell = hudCell(metric);
+      value.textContent = cell.text;
+      if (cell.cls) row.classList.add("thin");
+      n.textContent = metric.hits + "/" + metric.chances;
+    }
+
+    const hint = document.createElement("span");
+    hint.className = "hint";
+    hint.textContent = metric.hint;
+    row.append(label, value, n, hint);
+    card.appendChild(row);
+  });
+
+  const close = document.createElement("button");
+  close.className = "hud-close";
+  close.textContent = "关闭";
+  close.addEventListener("click", hideHud);
+  card.appendChild(close);
+  modal.hidden = false;
+}
+
+function hideHud() { $("hudModal").hidden = true; }
+
+async function refreshHud() {
+  // 统计一手牌才变一次，所以**不跟着每次动作的广播走**，只在这里主动拉
+  try { hud = await api("/api/hud"); render(); } catch (e) { /* 没建桌就没有 HUD */ }
 }
 
 async function api(path, options) {
@@ -391,6 +513,8 @@ function render() {
     stack.className = "seat-stack";
     stack.textContent = seat.stack + (seat.allIn ? " · 全下" : "");
     el.appendChild(stack);
+
+    el.appendChild(seatHud(seat));
 
     const bet = document.createElement("div");
     bet.className = "seat-bet";
@@ -534,6 +658,7 @@ async function nextHand() {
   try {
     state = await api("/api/hand", { method: "POST" });
     render();
+    refreshHud();
   } catch (error) {
     console.warn(error.message);
   }
@@ -544,7 +669,14 @@ async function nextHand() {
 function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   socket = new WebSocket(`${scheme}://${location.host}/ws`);
-  socket.onmessage = (event) => { state = JSON.parse(event.data); render(); };
+  socket.onmessage = (event) => {
+    const previous = state;
+    state = JSON.parse(event.data);
+    render();
+    // 统计只在**一手打完**之后才变，所以只在"刚刚结束"的那一刻拉一次，
+    // 不跟着每条广播走（那会把一份基本不动的数据请求几十遍）
+    if (previous && previous.inProgress && !state.inProgress) refreshHud();
+  };
   socket.onclose = () => setTimeout(connect, 1500);
 }
 
@@ -577,6 +709,7 @@ async function init() {
   connect();
   try {
     state = await api("/api/state");
+    refreshHud();
     $("setup").classList.add("hidden");
     render();
   } catch (error) {
@@ -586,5 +719,8 @@ async function init() {
 
 init();
 </script>
+<div class="hud-modal" id="hudModal" hidden>
+  <div class="hud-card" id="hudCard"></div>
+</div>
 </body>
 </html>

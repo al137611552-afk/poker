@@ -170,3 +170,75 @@ def test_index_page_is_served(client):
     assert response.status_code == 200
     assert "德扑训练台" in response.text
     assert "actionbar" in response.text
+
+
+# ------------------------------------------------------------------ HUD（FR-8）
+
+
+def _play_some_hands(client, count=4):
+    """打若干手，人类一律弃牌——只要牌进库，统计就有东西可算。"""
+    for _ in range(count):
+        client.post("/api/hand")
+        view = advance(client)
+        while view["inProgress"] and view["waitingForHuman"]:
+            client.post("/api/action", json={"kind": "fold"})
+            view = advance(client)
+
+
+def test_hud_needs_a_table_first(client):
+    assert client.get("/api/hud").status_code == 409
+
+
+def test_hud_reports_every_seat_even_before_any_hand(client):
+    """一手没打时也要给出每个座位——**HUD 缺一行比给 0% 更让人困惑**。"""
+    client.post("/api/table", json=six_max_payload())
+    body = client.get("/api/hud").json()
+    assert [s["seat"] for s in body["seats"]] == list(range(6))
+    assert all(s["hands"] == 0 for s in body["seats"])
+
+
+def test_every_metric_carries_its_sample_size(client):
+    """**HUD 最大的坑是拿 5 手牌的 VPIP 当真。**
+
+    够不够取决于看哪个指标（VPIP 几十手就稳，3bet 要几百手），所以服务端不替
+    前端定阈值，而是把原始计数一并给出去，让它自己决定标不标灰。
+    """
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client)
+    body = client.get("/api/hud").json()
+
+    for seat in body["seats"]:
+        rates = [m for m in seat["stats"] if "rate" in m]
+        assert len(rates) >= 8, "比率型指标不该少"
+        for metric in rates:
+            assert metric["hits"] <= metric["chances"], metric
+            if metric["chances"] == 0:
+                assert metric["rate"] is None, "没机会就不该给一个 0%"
+
+        # AF 不是比率，它有自己的形状——**别拿通用逻辑套它**，
+        # 那会画出一个 >100% 的百分比。
+        af = next(m for m in seat["stats"] if m["key"] == "aggression_factor")
+        assert "rate" not in af and "chances" not in af
+        assert af["value"] is None or af["value"] >= 0
+
+
+def test_a_metric_with_no_chances_is_none_not_zero(client):
+    """「从没面对过 3bet」和「面对 3bet 从不弃牌」是两件事，压成 0% 就分不开了。"""
+    client.post("/api/table", json=six_max_payload())
+    body = client.get("/api/hud").json()
+    rates = {m["key"]: m["rate"] for m in body["seats"][0]["stats"] if "rate" in m}
+    assert rates and all(value is None for value in rates.values()), "一手没打，全都该是「不知道」"
+
+
+def test_hud_scope_is_validated(client):
+    client.post("/api/table", json=six_max_payload())
+    assert client.get("/api/hud", params={"scope": "session"}).status_code == 200
+    assert client.get("/api/hud", params={"scope": "all"}).status_code == 200
+    assert client.get("/api/hud", params={"scope": "宇宙"}).status_code == 422
+
+
+def test_hud_is_not_pushed_with_every_state_broadcast(client):
+    """统计一手牌才变一次，跟着每次动作广播走等于把它推几十遍。"""
+    client.post("/api/table", json=six_max_payload())
+    view = client.get("/api/state").json()
+    assert "hud" not in view and "stats" not in view

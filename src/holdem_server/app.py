@@ -180,6 +180,18 @@ def create_app(
     async def get_state() -> dict:
         return manager.require_session().view()
 
+    @app.get("/api/hud")
+    async def get_hud(scope: str = "session") -> dict:
+        """牌桌浮层的统计（FR-8）。
+
+        **不塞进 `/api/state` 的广播里**：那条每次动作都推，而统计一手牌才变一次；
+        跟着广播走等于把一份基本不动的数据推几十遍，还让每次动作的延迟受它拖累。
+        前端在开局与每手结束后拉一次就够。
+        """
+        if scope not in ("session", "all"):
+            raise HTTPException(status_code=422, detail="scope 只能是 session 或 all")
+        return manager.require_session().hud(scope=scope)
+
     @app.post("/api/hand")
     async def start_hand() -> dict:
         async with manager.lock:

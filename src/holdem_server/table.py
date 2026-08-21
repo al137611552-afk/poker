@@ -233,6 +233,36 @@ class TableSession:
 
     # ------------------------------------------------------------ 视图
 
+    def hud(self, *, scope: str = "session") -> dict:
+        """牌桌浮层要的统计（FR-8）。口径来自 `stats.py`，这里一行都不重算。
+
+        **每个指标都连样本量一起给。** HUD 最大的坑就是拿 5 手牌的 VPIP 当真——
+        主流软件在样本少时会把数字标灰，我们把判断所需的原始计数直接交给前端，
+        而不是替它决定「够不够」：够不够取决于看哪个指标（VPIP 几十手就稳，
+        3bet 要几百手），塞死一个阈值反而会骗人。
+
+        `scope="session"` 只看这一局（默认）：座位名跨会话会对应到不同风格的 bot，
+        把它们混在一起统计等于把两个人的数据算给同一个人。
+        `scope="all"` 看全库，适合长期跟同一批对手打。
+        """
+        if self.store is None:
+            return {"scope": scope, "seats": [], "unavailable": "没有连数据库，统计不了"}
+
+        names = [cfg.name for cfg in self.config.seats]
+        session_id = None if scope == "all" else self.store_session_id
+        lines = self.store.player_stats(session_id=session_id, players=tuple(names))
+
+        seats = []
+        for seat, name in enumerate(names):
+            line = lines.get(name)
+            seats.append({
+                "seat": seat,
+                "name": name,
+                "hands": line.hands if line else 0,
+                "stats": _hud_metrics(line),
+            })
+        return {"scope": scope, "seats": seats}
+
     def view(self) -> dict:
         """给前端的公开状态。**除英雄本人与摊牌者外，底牌一律隐藏。**"""
         hand = self.hand
@@ -335,3 +365,47 @@ class TableSession:
         """底池大小的加注额，作为前端的一个快捷按钮。"""
         target = legal.call_to + hand.pot_size + legal.call_cost
         return max(legal.min_raise_to, min(target, legal.max_raise_to))
+
+
+_HUD_METRICS = (
+    ("vpip", "VPIP", "主动投钱"),
+    ("pfr", "PFR", "翻前加注"),
+    ("rfi", "开牌", "前面全弃时开牌"),
+    ("threebet", "3bet", "面对加注再加注"),
+    ("fold_to_threebet", "弃于3bet", "开牌后被 3bet 弃牌"),
+    ("cbet_flop", "持续下注", "翻前进攻方在翻牌下注"),
+    ("fold_to_cbet_flop", "弃于CB", "面对持续下注弃牌"),
+    ("wtsd", "WTSD", "看到翻牌后走到摊牌"),
+    ("wsd", "W$SD", "摊牌赢下"),
+)
+
+
+def _hud_metrics(line) -> list:
+    """把一行统计摊成前端好画的形状。
+
+    `rate` 为 `None` 表示**一次机会都没有过**——前端要把它显示成「—」而不是 0%。
+    「从没面对过 3bet」和「面对 3bet 从不弃牌」是两件事（`stats.Chance` 那条）。
+    """
+    out = []
+    for field, label, hint in _HUD_METRICS:
+        chance = getattr(line, field) if line else None
+        out.append({
+            "key": field,
+            "label": label,
+            "hint": hint,
+            "rate": chance.rate if chance else None,
+            "chances": chance.chances if chance else 0,
+            "hits": chance.hits if chance else 0,
+        })
+    # AF **不是**「机会/发生」那种结构，它是两个计数的比值。硬塞进 hits/chances
+    # 会造出 `hits > chances` 这种自相矛盾的数据（第一版就是这样，被测试逮到），
+    # 而前端只要照着通用逻辑画就会得出一个 >100% 的百分比。给它自己的字段名。
+    out.append({
+        "key": "aggression_factor",
+        "label": "AF",
+        "hint": "翻后（下注+加注）/跟注",
+        "value": line.aggression_factor if line else None,
+        "aggressive": line.postflop_aggressive if line else 0,
+        "calls": line.postflop_calls if line else 0,
+    })
+    return out
