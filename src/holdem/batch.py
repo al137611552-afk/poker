@@ -43,6 +43,7 @@ from random import Random
 from .bots import STYLES, Bot, BotStyle, play_out
 from .deck import deck_from_seed
 from .history import action_records
+from .stats import accumulate
 from .metrics import bb_per_100, bb_per_100_interval
 from .state import PREFLOP, HandConfig, HandState
 
@@ -292,71 +293,36 @@ def run_batch(config: MatchConfig, *, on_hand=None) -> BatchResult:
 
 
 def _collect(hand: HandState, stats: list[SeatStats]) -> int:
-    """把一手牌折进统计，返回这手牌的动作数。"""
+    """把一手牌折进统计，返回这手牌的动作数。
+
+    **口径不在这里定义**——统一由 `stats.py` 算（FR-7），这里只把结果搬进
+    `SeatStats` 的字段。曾经这两处各写一份判据，"跟在跛入者后面的加注算不算开牌"
+    这类规矩要改两个地方；漏改一处不会报错，只会让两份报表悄悄给出不同的数。
+
+    `SeatStats` 仍保留自己的字段名（历史报表与测试都建在上面），也仍然独占
+    盈亏那几项（`net` / `net_squares` / 照解走的决策数）——那些不是牌局统计，
+    是这场对局特有的账。
+    """
     records = action_records(hand)
-    seats = hand.config.num_seats
-    big_blind = hand.config.big_blind
+    lines: dict = {}
+    accumulate(hand, lines)
 
-    voluntary = [False] * seats
-    raised = [False] * seats
-    opened = [False] * seats
-    open_chance = [False] * seats
-    threebet = [False] * seats
-    threebet_chance = [False] * seats
-    folded_preflop = [False] * seats
-    raises = 0
-    entered = False
-    """前面有没有人主动入池（跛入也算）。「第一个入池」的机会只在没人进过时才有。"""
-
-    for record in records:
-        seat = record.seat
-        if record.street != PREFLOP:
-            continue
-        # 前面的人全弃了：现在这一下就是「第一个入池」的机会，与范围表的开牌口径一致。
-        # 分子分母必须用同一个判据——跟在跛入者后面的加注是「隔离」，不是开牌。
-        first_in = not entered
-        if first_in:
-            open_chance[seat] = True
-        elif raises == 1 and record.to_call > 0:
-            threebet_chance[seat] = True
-
-        if record.kind == "fold":
-            folded_preflop[seat] = True
-        if record.is_voluntary:
-            voluntary[seat] = True
-            entered = True
-        if record.kind in ("bet", "raise"):
-            raised[seat] = True
-            if first_in:
-                opened[seat] = True
-            elif raises == 1:
-                threebet[seat] = True
-            raises += 1
-
-    saw_flop = len(hand.board) >= 3
     net = hand.result.net
-    showdown_seats = hand.result.showdown_scores
-
-    for seat in range(seats):
+    for seat, line in lines.items():
         entry = stats[seat]
-        entry.hands += 1
+        entry.hands += line.hands
         entry.net += net[seat]
         entry.net_squares += float(net[seat]) * net[seat]
-        entry.vpip_hands += voluntary[seat]
-        entry.pfr_hands += raised[seat]
-        entry.open_chances += open_chance[seat]
-        entry.open_hands += opened[seat]
-        entry.threebet_chances += threebet_chance[seat]
-        entry.threebet_hands += threebet[seat]
-        if saw_flop and not folded_preflop[seat]:
-            entry.flops += 1
-        if seat in showdown_seats:
-            entry.showdowns += 1
-            if net[seat] > 0:
-                entry.showdown_wins += 1
+        entry.vpip_hands += line.vpip.hits
+        entry.pfr_hands += line.pfr.hits
+        entry.open_chances += line.rfi.chances
+        entry.open_hands += line.rfi.hits
+        entry.threebet_chances += line.threebet.chances
+        entry.threebet_hands += line.threebet.hits
+        entry.flops += line.wtsd.chances
+        entry.showdowns += line.wsd.chances
+        entry.showdown_wins += line.wsd.hits
 
-    # 大盲的盲注不是主动投钱，但翻前无人加注时他连一条记录都没有——上面按记录统计，
-    # 天然不会把他算进 VPIP，这里不用再修正。
     return len(records)
 
 

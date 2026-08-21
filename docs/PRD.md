@@ -28,7 +28,7 @@
 | FR-4 | 多人对战 | 2–9 座，可全 bot 自动对打，支持加速批量对局 | ✅ M1（`batch.py`，一万手三四分钟，分片并行；bb/100 带置信区间）|
 | FR-5 | 对手风格 | 每座位可选预设或自定义风格向量；统计落在目标区间 | ✅ M1（六档风格，VPIP/PFR 实测落在真人参考区间）|
 | FR-6 | 强度基线 | 接 Slumbot API（200bb）作强对手与外部标尺，跑出带置信区间的 bb/100；本地模型另做限时 spike，见 [ADR-0002](adr/0002-headsup-opponent-source.md) | ✅ M1（对局链路已通、每手对账、bb/100 带 95% 区间；单挑 200bb 范围表已接入，97.4% 的翻前决策照解走）|
-| FR-7 | 统计指标 | VPIP/PFR/3Bet/CBet/WTSD 等，口径与 PT4/HM3 一致 | 🔶 M2 口径模块已做（`stats.py`：VPIP/PFR/RFI/3bet/fold-to-3bet/CBet/fold-to-CBet/WTSD/W$SD/AF，可按位置拆）；已能从**落库牌谱**算（`HandStore.player_stats`，FR-8 的地基）；**待办：`batch.py` 那份重复实现合并进来** |
+| FR-7 | 统计指标 | VPIP/PFR/3Bet/CBet/WTSD 等，口径与 PT4/HM3 一致 | 🔶 M2 口径模块已做（`stats.py`：VPIP/PFR/RFI/3bet/fold-to-3bet/CBet/fold-to-CBet/WTSD/W$SD/AF，可按位置拆）；已能从**落库牌谱**算（`HandStore.player_stats`，FR-8 的地基）；`batch.py` 已改为复用同一份口径（只做字段搬运）。待办：把新指标（fold-to-3bet/CBet/AF）接进对局报表与 HUD |
 | FR-8 | 实时 HUD | 牌桌上显示每个对手的统计浮层 | ⬜ M2 |
 | FR-9 | 复盘打分 | 每个决策给出 EV 损失，带 A/B/C 置信度分级 | 🔶 M3 逐点 EV 损失已通（`review.py`）；**A/B/C 分级已做**（`confidence.py` + 报告里按场景给分布与「可信漏损」，[ADR-0007](adr/0007-confidence-grading.md)）；界面待做 |
 | FR-10 | 漏洞报告 | 按场景聚合 EV 损失并排序 | 🔶 聚合与排序已做（`leaks.py` + `scripts/leak_report.py`）；成规模跑要等求解粒度定下来 |

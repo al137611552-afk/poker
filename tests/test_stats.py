@@ -193,14 +193,15 @@ def test_an_unfinished_hand_says_so_instead_of_crashing():
 
 
 def test_the_shared_metrics_match_the_ones_batch_already_computes():
-    """**两份统计必须给出同一批数。**
+    """**`batch.py` 的那几个指标必须和这里完全一致。**
 
-    `batch.py` 里有一份边跑边累计的统计，口径是这份的子集。合并成一份是下一段的事，
-    但在合并之前得先钉住它们**没有漂**——两个模块各算各的、谁也不知道对方变了，
-    才是这类重复实现真正的代价。
+    这条最初是"防漂移"：那时 batch 自己写了一份判据，两边各算各的。
+    现在 batch 已经改成调用本模块、只做字段搬运，所以它**不再可能漂**——
+    它现在防的是**回退**：谁要是又在 batch 里加一段本地计算（"这里顺手算一下更快"），
+    这条立刻红。搬运本身也会错（字段对错位置不报错、只是数不对），照样归它管。
 
-    这条用例一红，要么是有人改了判据（那得两边一起改、并说明历史数据不可比），
-    要么就是漂了。
+    口径对照：`open_chances` = `rfi.chances`、`flops` = `wtsd.chances`、
+    `showdowns` = `wsd.chances`——分母的对应关系写在这儿，改字段时不用猜。
     """
     from holdem.batch import SeatStats, _collect
 
