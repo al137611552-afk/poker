@@ -293,3 +293,57 @@ def test_an_off_range_hand_contributes_no_solver_gap():
     assert report.scored_spots == 1
     assert report.solver_gaps == () and report.mean_solver_gap is None
     assert report.ranking_trustworthy() is None, "两路残差都没有＝判不了"
+
+
+# ---------------------------------------------------------------- 置信度分级进报告
+
+
+def _no_strategy(decision_point, loss, *, in_range=True):
+    """打上了分、但解没给频率的点——于是量不到「解自己离最优多远」。"""
+    score = DecisionScore(
+        evs={"CHECK": 0.0, "BET 3.0": -loss}, strategy={}, taken="BET 3.0"
+    )
+    return ScoredDecision(
+        point=decision_point, score=score, label="BET 3.0", in_range=in_range
+    )
+
+
+def test_each_scenario_carries_a_grade_distribution_not_one_letter():
+    """**一格一个字母是骗人的**：同一类局面里，有的点解得干净、有的整个落在残差里。
+
+    噪声底＝可利用度 0.5% × 底池 6bb ÷ 100 = 0.03bb，与该点 gap 取大的。
+    """
+    report = build_report(
+        [result([
+            scored(point(), 3.0),                      # 远高于噪声底 → A
+            scored(point(), 0.02),                     # 落在残差里 → C
+            scored(point(), 3.0, in_range=False),      # 表外牌 → C
+        ])],
+        hands=1, exploitability=[0.5], accuracy=1.0,
+    )
+    leak = report.leaks[0]
+    assert sum(leak.grades) == leak.spots, "每个打上分的点都要落进某一档"
+    assert leak.grades[0] == 1 and leak.grades[2] == 2
+
+
+def test_confident_loss_only_counts_the_a_grade_spots():
+    """两个漏损差得远＝这一格的名次是 B/C 档撑起来的，那不是打法漏洞、是噪声。"""
+    report = build_report(
+        [result([scored(point(), 3.0), scored(point(), 0.02)])],
+        hands=1, exploitability=[0.5], accuracy=1.0,
+    )
+    leak = report.leaks[0]
+    assert leak.total_loss == pytest.approx(3.02, abs=1e-6)
+    assert leak.confident_loss == pytest.approx(3.0, abs=1e-6)
+
+
+def test_a_spot_whose_noise_floor_cannot_be_measured_is_never_grade_a():
+    """两路残差都量不到时，**「不知道」不许读成「很好」**——一个 A 都不该有。
+
+    这条极少发生（只要解给了频率，`gap` 就有值），但正因为少，
+    它更容易在某次重构里被顺手抹掉：那时报告会在最该示警的时候显得最干净。
+    """
+    report = build_report([result([_no_strategy(point(), 3.0)])], hands=1)
+    leak = report.leaks[0]
+    assert leak.grades[0] == 0 and leak.grades[2] == 1
+    assert leak.confident_loss == 0.0

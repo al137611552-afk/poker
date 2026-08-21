@@ -119,7 +119,8 @@ def render(report, *, plan_count: int, dealt: int) -> str:
         f"（{plan_count / dealt:.0%}），本次求解了 {report.hands} 手",
         f"打上分的决策点 {report.scored_spots} 个，覆盖率 {report.coverage:.0%}",
         "",
-        f"{'场景':<34}{'次数':>6}{'总漏损':>10}{'平均':>9}{'每100手':>10}{'占比':>8}",
+        f"{'场景':<34}{'次数':>6}{'总漏损':>10}{'平均':>9}{'每100手':>10}{'占比':>8}"
+        f"{'A/B/C':>10}{'可信漏损':>10}",
     ]
     for leak in report.leaks:
         lines.append(
@@ -127,7 +128,16 @@ def render(report, *, plan_count: int, dealt: int) -> str:
             f"{leak.total_loss:>10.2f}{leak.mean_loss:>9.2f}"
             f"{report.per_100_hands(leak.total_loss):>10.1f}"
             f"{report.share(leak):>8.0%}"
+            f"{'/'.join(str(n) for n in leak.grades):>10}"
+            f"{leak.confident_loss:>10.2f}"
         )
+    lines.append("")
+    lines.append(
+        "  A/B/C＝这一格里三档置信度各多少个点；可信漏损＝只把 A 档那些点加起来。"
+    )
+    lines.append(
+        "  **两个漏损差得远，说明这行的名次是 B/C 档撑起来的**——那不是打法漏洞，是噪声。"
+    )
     lines.append("")
     lines.append(
         f"合计漏损 {report.total_loss:.2f}bb，"
@@ -318,6 +328,15 @@ def main() -> int:
                             "total_loss_bb": round(leak.total_loss, 4),
                             "mean_loss_bb": round(leak.mean_loss, 4),
                             "off_range_spots": leak.off_range_spots,
+                            # 置信度分布也要进 JSON：只落 total_loss 的话，
+                            # 事后拿这份文件排名的人**没法知道哪几行是噪声撑起来的**
+                            # （同 convergence 那条的理由）。
+                            "grades": {
+                                "A": leak.grades[0],
+                                "B": leak.grades[1],
+                                "C": leak.grades[2],
+                            },
+                            "confident_loss_bb": round(leak.confident_loss, 4),
                         }
                         for leak in report.leaks
                     ],

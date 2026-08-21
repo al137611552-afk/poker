@@ -60,6 +60,7 @@ from dataclasses import dataclass
 
 from holdem.state import FLOP, RIVER, TURN
 
+from .confidence import Confidence, grade
 from .review import DecisionPoint, ReviewResult, ScoredDecision
 
 __all__ = [
@@ -119,9 +120,27 @@ class ScenarioLeak:
     off_range_spots: int
     """其中英雄的牌不在假设范围里的点——风格层打的表外牌，别跟正常点一起解读。"""
 
+    grades: "tuple[int, int, int]" = (0, 0, 0)
+    """这一格里 A/B/C 三档各有多少个点（FR-9 的置信度分级）。
+
+    **一格一个字母是骗人的**：同一类局面里，有的点解得干净、牌也在范围里，
+    有的点整个落在残差里。给分布而不是给单一等级，读的人才判断得了这一行该不该信。
+    """
+
+    confident_loss: float = 0.0
+    """只把 **A 档**那些点的漏损加起来。
+
+    排序仍然用 `total_loss`（换掉它等于悄悄改了报告的语义），但两个数并排放着，
+    差得远就说明这一格的名次是 B/C 档的点撑起来的——那不是打法漏洞，是噪声。
+    """
+
     @property
     def mean_loss(self) -> float:
         return self.total_loss / self.spots if self.spots else 0.0
+
+    @property
+    def confident_spots(self) -> int:
+        return self.grades[0]
 
 
 @dataclass(frozen=True)
@@ -291,27 +310,51 @@ def build_report(
     自己可不可信——**不给不报错，但 `ranking_trustworthy()` 会返回「判不了」。**
     """
     results = list(results)
-    totals: dict[Scenario, list] = {}
     skipped: Counter = Counter()
-    scored_spots = 0
     solver_gaps: list[float] = []
 
+    # 第一遍只收集。**分级要等收敛度算出来**（噪声底是它给的），
+    # 而收敛度要看完全部结果才有——所以这里不能边走边定档。
+    collected: list[tuple[Scenario, object]] = []
     for result in results:
         aggressor = result.plan.setup.aggressor_seat
         for decision in result.decisions:
             if decision.score is None:
                 skipped[decision.skipped or "没说原因"] += 1
                 continue
-            scenario = scenario_of(decision.point, aggressor_seat=aggressor)
-            bucket = totals.setdefault(scenario, [0, 0.0, 0])
-            bucket[0] += 1
-            bucket[1] += _loss_of(decision)
-            bucket[2] += 0 if decision.in_range else 1
-            scored_spots += 1
+            collected.append((scenario_of(decision.point, aggressor_seat=aggressor), decision))
             gap = _solver_gap(decision)
             if gap is not None:
                 solver_gaps.append(gap)
 
+    convergence = _convergence(results, exploitability, accuracy)
+    batch_floor = convergence.noise_floor if convergence else None
+
+    # 第二遍定档并聚合。
+    totals: dict[Scenario, list] = {}
+    for scenario, decision in collected:
+        bucket = totals.setdefault(scenario, [0, 0.0, 0, [0, 0, 0], 0.0])
+        loss = _loss_of(decision)
+        bucket[0] += 1
+        bucket[1] += loss
+        bucket[2] += 0 if decision.in_range else 1
+
+        level, _ = grade(
+            in_range=decision.in_range,
+            loss=loss,
+            noise_floor=_point_floor(batch_floor, _solver_gap(decision)),
+            # 这两个信号服务于**方案 B 那条路**（每街一棵小树 + 滚范围）。
+            # 现在这条路走的是一棵多层大树，转/河牌的范围是树里长出来的、没经过
+            # 按牌类聚合，所以传 0/False 是**事实**，不是乐观的默认值。
+            # 接上 rollout 之后要把真值传进来，否则那两档降级就白写了。
+            hand_class_flagged=False,
+            rolled_streets=0,
+        )
+        bucket[3][level_index(level)] += 1
+        if level is Confidence.A:
+            bucket[4] += loss
+
+    scored_spots = len(collected)
     leaks = tuple(
         sorted(
             (
@@ -320,8 +363,10 @@ def build_report(
                     spots=spots,
                     total_loss=loss,
                     off_range_spots=off_range,
+                    grades=(counts[0], counts[1], counts[2]),
+                    confident_loss=confident,
                 )
-                for scenario, (spots, loss, off_range) in totals.items()
+                for scenario, (spots, loss, off_range, counts, confident) in totals.items()
             ),
             key=lambda leak: (-leak.total_loss, leak.scenario.title),
         )
@@ -333,8 +378,22 @@ def build_report(
         skipped=tuple(skipped.most_common()),
         uncovered_hands=tuple(Counter(uncovered).most_common()),
         solver_gaps=tuple(solver_gaps),
-        convergence=_convergence(results, exploitability, accuracy),
+        convergence=convergence,
     )
+
+
+def level_index(level: "Confidence") -> int:
+    return {Confidence.A: 0, Confidence.B: 1, Confidence.C: 2}[level]
+
+
+def _point_floor(batch_floor: "float | None", point_gap: "float | None") -> "float | None":
+    """这**一个点**上的噪声底：整批可利用度与该点自身 gap **取大的**。
+
+    两个都量不到就是 `None`，而 `None` 在分级里是 C 档——
+    「量不到」不许读成「很好」（同 `LeakReport.noise_floor` 那条）。
+    """
+    floors = [value for value in (batch_floor, point_gap) if value is not None]
+    return max(floors) if floors else None
 
 
 def _convergence(results, exploitability, accuracy) -> Convergence | None:
