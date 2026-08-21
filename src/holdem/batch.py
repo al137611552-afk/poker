@@ -74,6 +74,15 @@ class MatchConfig:
     start_stack: int = 10_000
     """每手开局的筹码，默认 100bb。"""
     seed: int = 0
+    range_aware_seats: "tuple[int, ...] | None" = None
+    """哪些座位用**范围感知**的翻后权益（FR-11）。
+
+    `None`（默认）＝**全开**，那是 A/B 之后的默认行为。给一个座位元组则只开那几个。
+
+    做成逐座位而不是全局开关，是因为 A/B 只有**同桌直接对抗**才说明问题：
+    全桌一起开，六个人的 bb/100 加起来还是 0，看不出这个改动是好是坏。
+    一半开一半不开、风格相同、按钮逐手轮转，差异就只剩权益口径这一处。
+    """
     first_button: int = 0
     samples: int | None = None
     """覆盖所有风格的蒙特卡洛采样数；`None` 表示各用各的默认值。"""
@@ -135,6 +144,14 @@ class SeatStats:
     table_decisions: int = 0
     """照范围表走的翻前决策数。"""
     fallback_decisions: int = 0
+    range_decisions: int = 0
+    """翻后**真用上**对手范围算权益的决策数（FR-11）。"""
+    range_missed: int = 0
+    """想用范围但用不上的次数（多人底池 / 翻前线路表里没有 / 范围被撞光）。
+
+    **这个数必须一起报**：如果绝大多数决策都落在这儿，那 A/B 比的根本不是
+    范围感知的效果，而是两组随机数——结论会看着像回事却毫无意义。
+    """
 
     def add(self, other: "SeatStats") -> None:
         if (self.seat, self.style) != (other.seat, other.style):
@@ -261,7 +278,10 @@ def run_batch(config: MatchConfig, *, on_hand=None) -> BatchResult:
     styles = config.resolved_styles()
     # 每个 bot 一条独立的随机流，种子由主流派生：整场对局只由 config.seed 一个数决定
     bots = {
-        seat: Bot(styles[seat], seed=master.randrange(1 << 30)) for seat in range(seats)
+        seat: Bot(styles[seat], seed=master.randrange(1 << 30),
+                  range_aware=(config.range_aware_seats is None
+                               or seat in config.range_aware_seats))
+        for seat in range(seats)
     }
     stats = [SeatStats(seat=s, style=config.styles[s]) for s in range(seats)]
     result = BatchResult(config=config, seats=stats)
@@ -289,6 +309,8 @@ def run_batch(config: MatchConfig, *, on_hand=None) -> BatchResult:
     for seat, bot in bots.items():
         stats[seat].table_decisions = bot.table_hits
         stats[seat].fallback_decisions = bot.fallback_hits
+        stats[seat].range_decisions = bot.range_hits
+        stats[seat].range_missed = bot.range_misses
     return result
 
 

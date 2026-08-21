@@ -32,7 +32,10 @@ import threading
 from dataclasses import dataclass
 
 from .actions import Action, bet, call, check, fold, raise_to
-from .equity import monte_carlo_equity
+from .equity import equity_vs_range, monte_carlo_equity
+from .history import action_records
+from .postflop_ranges import expand, narrow
+from .range_tracking import NotCovered, flop_ranges
 from .preflop_policy import (
     PolicyDecision,
     PreflopPolicySet,
@@ -119,6 +122,7 @@ class Bot:
         style: BotStyle | str = DEFAULT_STYLE,
         seed: int | None = None,
         policy: "PreflopPolicySet | PreflopTablePolicy | None" = None,
+        range_aware: bool = True,
     ) -> None:
         if isinstance(style, str):
             if style not in STYLES:
@@ -130,6 +134,20 @@ class Bot:
         self.table_hits = 0
         """照解走了多少次决策——自对弈时用来看解的覆盖率。"""
         self.fallback_hits = 0
+        self.range_aware = range_aware
+        """翻后按对手范围算权益（FR-11），而不是按随机牌。
+
+        **默认开着，是 2 万手 A/B 的结论**（2026-08-22，见 DEVLOG）：同桌对抗下
+        范围组 +306 bb/100，三个座位区间都不跨零。
+
+        更要紧的是对照实验排除了「只是变紧了」这个替代解释：把对手换成更紧的
+        `nit` 风格，它的 WTSD 仍是 64%（跟 tag 一模一样）——**风格参数根本控制不了
+        翻后的跟注松紧**，43% 那个数是调风格达不到的。
+        """
+        self.range_hits = 0
+        """真用上范围权益的翻后决策数。"""
+        self.range_misses = 0
+        """想用但用不上的次数（多人底池 / 翻前线路表里没有 / 范围被撞光）。"""
 
     def act(self, hand: HandState) -> Action:
         """给出当前行动座位的动作。调用方保证 hand 未结束。"""
@@ -154,13 +172,21 @@ class Bot:
             return self._act_preflop_fallback(hand, legal, strength)
 
         opponents = max(1, len(hand.contenders()) - 1)
-        equity = monte_carlo_equity(
-            hand.hole[seat],
-            hand.board,
-            opponents,
-            samples=self.style.samples,
-            rng=self.rng,
-        )
+        equity = None
+        if self.range_aware:
+            equity = self._range_equity(hand, seat)
+            if equity is None:
+                self.range_misses += 1
+            else:
+                self.range_hits += 1
+        if equity is None:
+            equity = monte_carlo_equity(
+                hand.hole[seat],
+                hand.board,
+                opponents,
+                samples=self.style.samples,
+                rng=self.rng,
+            )
         if legal.can_check:
             return self._act_unopened(hand, legal, equity)
         return self._act_facing_bet(hand, legal, equity)
@@ -236,6 +262,57 @@ class Bot:
         bb = hand.config.big_blind
         target = 3 * bb if legal.call_to <= bb else int(round(legal.call_to * 2.5))
         return max(legal.min_raise_to, min(target, legal.max_raise_to))
+
+    # ------------------------------------------------------------ 范围感知权益（FR-11）
+
+    def _range_equity(self, hand: HandState, seat: int) -> "float | None":
+        """按对手的**当前范围**估权益。用不上就返回 `None`，由调用方退回随机牌口径。
+
+        用不上的三种情况，都不是错误：
+
+        1. **多人底池**——各家范围互相依赖，用单人范围逐个近似会高估自己的赢面，
+           那种近似不如老实用随机牌的下限假设（`equity_vs_range` 也只收单个对手）。
+        2. **翻前线路表里没有**（跛入、4bet、多人进翻牌…）——`flop_ranges` 抛
+           `NotCovered`，这时我们对他翻牌时的范围一无所知，硬编一个只会更差。
+        3. **范围被撞光**——他不可能拿着我手里或牌面上的牌。
+
+        每次决策都重算一遍范围（而不是增量维护）：牌局对象是唯一的真相源，
+        缓存一份"当前范围"意味着它可能与实际线路不同步，而那种不同步**不会报错**，
+        只会让权益悄悄算错。这里的开销实测可接受（见 DEVLOG 的 A/B 记录）。
+        """
+        contenders = hand.contenders()
+        if len(contenders) != 2:
+            return None
+        villain = next(s for s in contenders if s != seat)
+
+        try:
+            setup = flop_ranges(hand)
+        except NotCovered:
+            return None
+
+        board = tuple(hand.board)
+        flop = board[:3]
+        current = expand(setup.range_of(villain), flop)
+
+        # 沿实战线路逐个动作收缩。**只收对手的动作**——我自己的动作不含他的信息。
+        for record in action_records(hand):
+            if record.street == PREFLOP or record.seat != villain:
+                continue
+            if record.kind == "fold":
+                break
+            if record.kind not in ("bet", "raise", "call", "check"):
+                continue
+            street_board = board[: 3 + max(0, record.street - 1)]
+            current = narrow(current, street_board, record.kind)
+
+        return equity_vs_range(
+            hand.hole[seat],
+            board,
+            current.combos(),
+            weights=[current.weights[c] for c in current.combos()],
+            samples=self.style.samples,
+            rng=self.rng,
+        )
 
     # ------------------------------------------------------------ 翻后无人下注
 
