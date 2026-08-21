@@ -9,6 +9,7 @@
 .venv/bin/python -m pytest           # 全量单测（约 2 分钟，含服务端与 PokerKit 互认）
 python3 -m pytest                    # 系统 Python：自动跳过需要额外依赖的测试
 python3 -m pytest tests/test_state.py -k all_in   # 跑单个主题
+python3 -m pytest tests/test_stats.py           # 牌局统计（FR-7）：口径与 PT4/HM3 对齐
 python3 scripts/soak.py 200000       # 随机自对弈压测 + 牌谱往返抽验 + 吞吐测量
 python3 scripts/build_preflop_equity.py   # 重算翻前权益表（2 核约 22 分钟，通常不用跑）
 python3 scripts/build_preflop_ranges.py   # 重算六人桌翻前范围表（约 23 分钟，通常不用跑）
