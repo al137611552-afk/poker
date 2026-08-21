@@ -393,3 +393,47 @@ def test_solver_evs_match_the_hand_computed_spot(tmp_path):
     for hand, evs in facing.items():
         assert evs["FOLD"] + own_commit == pytest.approx(0.0, abs=1e-6), hand
         assert evs["CALL"] + own_commit == pytest.approx(-9.0, abs=1e-6), hand
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not TexasSolver.supports_evs(),
+                    reason="求解器不认 dump_evs（要按 docs/solver-build 自己编，官方预编译包没有）")
+def test_solver_evs_agree_with_the_evs_we_compute_on_the_tree(tmp_path):
+    """**两条独立路径互证**：树上积出来的 EV，与求解器直给的 EV，必须是同一批数。
+
+    这比手算那道门更值钱。手算只覆盖「结果完全确定」的局面（每手牌胜负已定），
+    那种局面下很多环节的错误会互相抵消；这里是**混合策略下的普通局面**，
+    我们自己积期望的那套（`evaluate.py` 的遍历、到达概率、投入账）与求解器内部
+    完全独立地算出同一个数，才说明两边都没算错。
+
+    翻译口径写在断言里而不是藏进函数：
+    `我们的 EV = 求解器 EV + 底池的一半 + 从根节点起自己投进去的钱`。
+    根节点上后一项是 0。
+    """
+    solver = TexasSolver(cache_dir=tmp_path / "cache", threads=2)
+    request = SolveRequest(
+        board=BOARD,
+        pot=POT,
+        effective_stack=9.0,
+        # 刻意不用「胜负已定」的范围：要的就是混合策略下的普通局面
+        oop_range=Range.parse("QQ, 99, 33, AKo"),
+        ip_range=Range.parse("AA, KK, QJs, 87s"),
+        accuracy=0.3,
+        max_iterations=120,
+    )
+    report = solver.solve(request)
+    spot = Spot.from_request(request)
+    from_solver = solver.solve_evs(request, (), player=0)   # OOP 在根节点
+
+    checked = 0
+    for hand_text, solver_evs in from_solver.items():
+        cards = (card_from_str(hand_text[:2]), card_from_str(hand_text[2:]))
+        ours = score_decision(spot, report.root, line=(), hero=0, hero_cards=cards)
+        for label, solver_ev in solver_evs.items():
+            assert label in ours.evs, (hand_text, label, sorted(ours.evs))
+            # 容差跟着解的收敛度走：没收敛的解两边都在动，钉太死只会得到一个 flaky 的门
+            assert ours.evs[label] == pytest.approx(solver_ev + POT / 2, abs=0.15), (
+                hand_text, label, ours.evs[label], solver_ev + POT / 2
+            )
+            checked += 1
+    assert checked >= 20, f"只比了 {checked} 个数，样本太小说明不了问题"
