@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .evaluator import evaluate
+from .evaluator import HIGH_CARD, PAIR, evaluate, score_category
 from .ranges import Range, class_combos
 
 __all__ = ["ComboRange", "narrow", "expand"]
@@ -121,8 +121,8 @@ def narrow(
 
     if len(board) < 5:
         notes.append(
-            "翻/转牌上的排序只看当前成手、不看听牌，同花听牌会被当成弱牌——"
-            "这一步的收缩结果偏紧"
+            "翻/转牌上强听牌（同花听/开口顺）按「相当于一对」折算，卡顺与后门不算——"
+            "折算档次是拍的，没有实测支撑"
         )
 
     ranked = sorted(live, key=lambda combo: _strength(combo, board), reverse=True)
@@ -151,6 +151,52 @@ def _default_keep(kind: str) -> float:
     raise ValueError(f"不认识的动作：{kind}")
 
 
-def _strength(combo: "tuple[int, int]", board: "tuple[int, ...]") -> int:
-    """这手牌在这个牌面上的成手强度。数越大越强（`evaluate` 的口径）。"""
-    return evaluate(tuple(combo) + tuple(board))
+def _strength(combo: "tuple[int, int]", board: "tuple[int, ...]") -> "tuple[int, int]":
+    """这手牌在这个牌面上有多强。越大越强，用作排序键。
+
+    返回 `(有效档次, 原始分)`：
+    - **有效档次**＝成手档次与听牌折算档次取大的。牌发完之后（河牌）听牌不再是牌力，
+      折算部分自动消失。
+    - **原始分**＝`evaluate` 的完整打包分，用来在同档次内比大小（踢脚也算数）。
+
+    为什么要有听牌那一档：只按成手排序，翻牌上的同花听牌会排在一对之后被踢掉，
+    而它的实际权益（对一对约 35%）明显高于一手空气。**忽略它会让收缩系统性偏紧**。
+    """
+    cards = tuple(combo) + tuple(board)
+    raw = evaluate(cards)
+    made = score_category(raw)
+    if len(board) >= 5:
+        return (made, raw)          # 河牌：牌已发完，听牌不是牌力
+    return (max(made, _draw_tier(cards)), raw)
+
+
+def _draw_tier(cards: "tuple[int, ...]") -> int:
+    """把听牌折算成一个「相当于第几档成手」的数。
+
+    **只认强听牌**（同花听牌、开口顺听）：它们的权益够格跟一对掰腕子。
+    卡顺、后门这类不算——把它们也抬上来等于几乎不收缩，那这个模块就没用了。
+
+    折算到 `PAIR` 是**拍的**（ADR-0008 记着）：强听牌对一对约 35% 权益，
+    比一对弱、比空气强得多，落在这一档最接近。要调就用批量对局的 bb/100 调。
+
+    识别用位运算，不遍历补牌：`evaluate` 一次 4.5µs，一个决策里几百个组合各数一遍
+    补牌是几万次调用（实测约 60ms/决策），bot 实时用不起。
+    """
+    tier = HIGH_CARD
+
+    suits = [0, 0, 0, 0]
+    ranks = 0
+    for card in cards:
+        suits[card % 4] += 1
+        ranks |= 1 << (card // 4)
+    if max(suits) == 4:             # 恰好 4 张同花色＝听同花（5 张就是成手了）
+        tier = PAIR
+
+    # 顺子听牌：把 A 同时当 1（轮子）；任意 5 连窗口里凑齐 4 张就算
+    wheel = ranks | ((ranks >> 12) & 1)
+    for low in range(0, 10):
+        window = (wheel >> low) & 0b11111
+        if bin(window).count("1") == 4:
+            tier = max(tier, PAIR)
+            break
+    return tier

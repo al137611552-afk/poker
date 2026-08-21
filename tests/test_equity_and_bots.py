@@ -209,3 +209,72 @@ def test_all_styles_are_playable():
         hand, bots = _table(3, style=style, seed=11)
         play_out(hand, bots)
         assert hand.is_complete
+
+
+# ------------------------------------------------------------------ 范围感知的权益（FR-11）
+
+
+def test_equity_against_a_range_is_nothing_like_equity_against_random_cards():
+    """**这就是范围跟踪的全部意义。**
+
+    KQo 在 Qs7h2c 上是顶对，对随机牌接近九成；但对手若只有 AA/KK（两手超对），
+    它是大落后。bot 一直用的是前一个数——于是紧手和鱼在它眼里没区别。
+    """
+    import random
+
+    from holdem.cards import card_from_str, cards_from_str
+    from holdem.equity import equity_vs_range, monte_carlo_equity
+    from holdem.postflop_ranges import expand
+    from holdem.ranges import Range
+
+    hole = [card_from_str("Kd"), card_from_str("Qh")]
+    board = cards_from_str("Qs7h2c")
+    combos = expand(Range.parse("AA, KK"), tuple(board)).combos()
+
+    versus_random = monte_carlo_equity(hole, board, 1, samples=1500, rng=random.Random(1))
+    versus_range = equity_vs_range(hole, board, combos, samples=1500, rng=random.Random(1))
+    assert versus_random > 0.75
+    assert versus_range < 0.35
+    assert versus_random - versus_range > 0.4, "差得越大，忽略范围的代价就越大"
+
+
+def test_a_range_that_is_entirely_blocked_returns_none_not_zero():
+    """**「算不了」不是「必输」。** 返回 0 会让 bot 弃掉一手好牌。"""
+    from holdem.cards import card_from_str, cards_from_str
+    from holdem.equity import equity_vs_range
+
+    hole = [card_from_str("Ah"), card_from_str("Ad")]
+    board = cards_from_str("Qs7h2c")
+    only_combo = [(card_from_str("Ah"), card_from_str("Ad"))]     # 正是我手里那两张
+    assert equity_vs_range(hole, board, only_combo, samples=10) is None
+
+
+def test_blocked_combos_are_skipped_rather_than_poisoning_the_estimate():
+    """对手不可能拿着我手里或牌面上的牌——留着它们会让估计整体偏。"""
+    import random
+
+    from holdem.cards import card_from_str, cards_from_str
+    from holdem.equity import equity_vs_range
+
+    hole = [card_from_str("Ah"), card_from_str("Ad")]
+    board = cards_from_str("Qs7h2c")
+    combos = [
+        (card_from_str("Ah"), card_from_str("Ac")),   # 撞我手里的 Ah
+        (card_from_str("Qs"), card_from_str("Qd")),   # 撞牌面的 Qs
+        (card_from_str("Kh"), card_from_str("Kd")),   # 干净
+    ]
+    value = equity_vs_range(hole, board, combos, samples=400, rng=random.Random(3))
+    assert value is not None and value > 0.7, "只剩 KK 可对，AA 该大幅领先"
+
+
+def test_weights_must_line_up_with_combos():
+    from holdem.cards import card_from_str
+    from holdem.equity import equity_vs_range
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="权重数量"):
+        equity_vs_range(
+            [card_from_str("Ah"), card_from_str("Ad")], [],
+            [(0, 1), (2, 3)], weights=[1.0], samples=10,
+        )

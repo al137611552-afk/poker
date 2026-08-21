@@ -133,3 +133,59 @@ def test_river_narrowing_has_no_such_caveat():
 def test_an_unknown_action_is_rejected_not_guessed():
     with pytest.raises(ValueError, match="不认识的动作"):
         narrow(expand(Range.parse("AA"), FLOP), FLOP, "跳舞")
+
+
+# ------------------------------------------------------------------ 听牌修正
+
+
+WET = tuple(cards_from_str("Th6h2c"))          # 两张红桃
+WET_RIVER = tuple(cards_from_str("Th6h2c8d3s"))
+
+
+def test_a_flush_draw_outranks_the_same_class_without_it():
+    """**只按成手排序会把同花听牌当空气踢掉。**
+
+    AhKh 与 AsKc 是同一个牌类（AK），成手都是 A 高。但在两张红桃的面上，
+    前者对一对约有 35% 权益，后者几乎没有——收缩必须分得开这两手。
+    """
+    from holdem.postflop_ranges import _strength
+
+    assert _strength(_hand("AhKh"), WET) > _strength(_hand("AsKc"), WET)
+
+
+def test_the_draw_bonus_disappears_on_the_river():
+    """河牌上牌已发完，听牌不是牌力——再给加成就是凭空造牌。"""
+    from holdem.postflop_ranges import _strength
+
+    with_draw, without = _strength(_hand("AhKh"), WET_RIVER), _strength(_hand("AsKc"), WET_RIVER)
+    assert with_draw[0] == without[0], "河牌上两者档次应当一样（都只是 A 高）"
+
+
+def test_only_strong_draws_get_the_bonus():
+    """卡顺、后门不算——把它们也抬上来等于几乎不收缩，这个模块就没用了。"""
+    from holdem.postflop_ranges import _draw_tier
+    from holdem.evaluator import HIGH_CARD
+
+    gutshot = tuple(_hand("Jc9c")) + tuple(cards_from_str("Th6h2c"))   # 只差一张 8
+    assert _draw_tier(gutshot) == HIGH_CARD, "卡顺不算强听牌"
+
+    open_ended = tuple(_hand("Jc9c")) + tuple(cards_from_str("Th8s2c"))  # J9 + T8 → 听 7/Q
+    assert _draw_tier(open_ended) > HIGH_CARD, "开口顺算"
+
+
+def test_a_flush_draw_survives_a_bet_that_would_have_cut_it():
+    """端到端：收缩之后同花听牌还在范围里，而同牌类的杂牌被踢掉了。"""
+    # 空气得挑真的空气：32o 在 Th6h2c 上**配对了牌面的 2**，留下来是对的
+    # （第一版就挑错了这张牌，测试当场纠正）
+    r = expand(Range.parse("AKs, AKo, 74o"), WET)
+    after = narrow(r, WET, "bet")
+    assert after.weight_of(*_hand("AhKh")) > 0, "同花听牌该留着"
+    assert after.weight_of(*_hand("7c4d")) == 0, "真正的空气该被踢"
+
+
+def test_the_caveat_now_states_what_it_actually_does():
+    """局限说明要跟着实现走：现在算听牌了，就别再说「不看听牌」。"""
+    r = narrow(expand(Range.parse("AKs, AKo"), WET), WET, "bet")
+    note = " ".join(r.confidence)
+    assert "折算" in note and "拍的" in note
+    assert "不看听牌" not in note

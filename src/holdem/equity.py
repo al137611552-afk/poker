@@ -81,6 +81,73 @@ def monte_carlo_equity(
     return total / samples
 
 
+def equity_vs_range(
+    hole: object,
+    board: object,
+    opponent_combos: object,
+    *,
+    weights: object = None,
+    samples: int = 200,
+    rng: "random.Random | None" = None,
+) -> "float | None":
+    """对手手牌**从给定范围里抽**，而不是从整副牌均匀抽（FR-11）。
+
+    `monte_carlo_equity` 的假设是「对手范围＝任意两张」，那是刻意的下限：
+    真实对手的范围更强，所以那个数偏乐观。有了翻后范围跟踪
+    （`postflop_ranges`）之后，这里可以用真正的范围来估。
+
+    - `opponent_combos`：`(牌, 牌)` 的序列；与我方底牌或公共牌**撞牌的会被跳过**。
+    - `weights`：与 combos 一一对应的权重；不给就等权。
+    - 返回 `None`：**范围里一手可用的牌都不剩**（全撞牌了）。这不是 0% 权益，
+      是「算不了」——返回 0 会让 bot 以为自己必输而弃掉一手好牌。
+
+    只支持**单个**对手：多人底池里各家范围互相依赖，用单人范围逐个近似会
+    高估自己的赢面，那种近似不如老老实实用随机牌的下限假设。
+    """
+    hole = list(hole)  # type: ignore[arg-type]
+    board = list(board)  # type: ignore[arg-type]
+    if len(hole) != 2:
+        raise ValueError("底牌必须是两张")
+    if samples < 1:
+        raise ValueError("样本数必须为正")
+
+    known = set(hole) | set(board)
+    combos = list(opponent_combos)  # type: ignore[arg-type]
+    values = list(weights) if weights is not None else [1.0] * len(combos)
+    if len(values) != len(combos):
+        raise ValueError("权重数量与组合数量不一致")
+
+    live: list = []
+    live_weights: list = []
+    for combo, weight in zip(combos, values):
+        if weight <= 0:
+            continue
+        if combo[0] in known or combo[1] in known:
+            continue        # 撞牌：他不可能拿着我手里或牌面上的牌
+        live.append(list(combo))
+        live_weights.append(weight)
+    if not live:
+        return None
+
+    rng = rng or random.Random()
+    needed_board = BOARD_SIZE - len(board)
+    total = 0.0
+    for _ in range(samples):
+        opponent = rng.choices(live, weights=live_weights, k=1)[0]
+        unseen = [c for c in FULL_DECK if c not in known and c not in opponent]
+        if needed_board > len(unseen):
+            raise ValueError("剩余的牌不足以完成抽样")
+        full_board = board + (rng.sample(unseen, needed_board) if needed_board else [])
+
+        mine = evaluate(hole + full_board)
+        theirs = evaluate(opponent + full_board)
+        if mine > theirs:
+            total += 1.0
+        elif mine == theirs:
+            total += 0.5
+    return total / samples
+
+
 def exact_equity(
     hole_a: object,
     hole_b: object,
