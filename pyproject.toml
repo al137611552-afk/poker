@@ -16,6 +16,10 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",      # FastAPI TestClient
     "pokerkit>=0.5",    # 仅用于牌谱格式的外部互认测试
+    # **dev 必须把 server 拉进来**：`tests/test_server.py` 要 fastapi 才跑得起来，
+    # 只装 dev 的话它直接 ImportError——「装了开发依赖却跑不了全部测试」这种环境
+    # 不该存在。2026-08-22 真机踩到：照文档只装 dev，起服务时 uvicorn 缺失。
+    "holdem-trainer[server]",
 ]
 
 [tool.setuptools.packages.find]

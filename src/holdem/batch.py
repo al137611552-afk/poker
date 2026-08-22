@@ -43,6 +43,7 @@ from random import Random
 from .bots import STYLES, Bot, BotStyle, play_out
 from .deck import deck_from_seed
 from .history import action_records
+from .postflop_ranges import KeepProfile
 from .stats import accumulate
 from .metrics import bb_per_100, bb_per_100_interval
 from .state import PREFLOP, HandConfig, HandState
@@ -74,6 +75,8 @@ class MatchConfig:
     start_stack: int = 10_000
     """每手开局的筹码，默认 100bb。"""
     seed: int = 0
+    keep_profile: "KeepProfile | None" = None
+    """翻后收缩参数（`None`＝默认那一套）。扫参校准时逐组传进来。"""
     range_aware_seats: "tuple[int, ...] | None" = None
     """哪些座位用**范围感知**的翻后权益（FR-11）。
 
@@ -280,7 +283,8 @@ def run_batch(config: MatchConfig, *, on_hand=None) -> BatchResult:
     bots = {
         seat: Bot(styles[seat], seed=master.randrange(1 << 30),
                   range_aware=(config.range_aware_seats is None
-                               or seat in config.range_aware_seats))
+                               or seat in config.range_aware_seats),
+                  keep_profile=config.keep_profile)
         for seat in range(seats)
     }
     stats = [SeatStats(seat=s, style=config.styles[s]) for s in range(seats)]

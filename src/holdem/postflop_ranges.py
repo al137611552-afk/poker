@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from .evaluator import HIGH_CARD, PAIR, evaluate, score_category
 from .ranges import Range, class_combos
 
-__all__ = ["ComboRange", "narrow", "expand"]
+__all__ = ["ComboRange", "KeepProfile", "DEFAULT_PROFILE", "narrow", "expand"]
 
 # 各动作保留范围里最强的百分之多少。**这些数是拍的**，没有实测支撑，
 # 调它们要拿批量对局的 bb/100 调，别拿直觉调（ADR 里记着这一条）。
@@ -49,6 +49,34 @@ KEEP_ON_CALL = 0.75
 KEEP_ON_CHECK = 1.0
 """过牌：**一点都不收。** 过牌几乎不含信息：强牌可以埋伏、弱牌可以放弃，
 两头都在。收它等于凭空造出一个「他没牌」的结论。"""
+
+
+@dataclass(frozen=True)
+class KeepProfile:
+    """收缩参数的一套取值。
+
+    做成可注入的对象、而不是直接读模块常量：**校准要并排跑好几套参数**，
+    改全局常量的做法在多进程里会串台，而且改错了不会报错、只会让某一组的结果
+    悄悄用上另一组的参数。
+    """
+
+    bet: float = KEEP_ON_BET
+    call: float = KEEP_ON_CALL
+    check: float = KEEP_ON_CHECK
+    draw_tier: int = PAIR
+    """强听牌折算到第几档成手。见 `_draw_tier`。"""
+
+    def keep_for(self, kind: str) -> float:
+        if kind in ("bet", "raise"):
+            return self.bet
+        if kind == "call":
+            return self.call
+        if kind == "check":
+            return self.check
+        raise ValueError(f"不认识的动作：{kind}")
+
+
+DEFAULT_PROFILE = KeepProfile()
 
 
 @dataclass
@@ -98,7 +126,8 @@ def expand(hand_range: Range, board: "tuple[int, ...]") -> ComboRange:
 
 
 def narrow(
-    current: ComboRange, board: "tuple[int, ...]", kind: str, *, keep: "float | None" = None
+    current: ComboRange, board: "tuple[int, ...]", kind: str, *,
+    keep: "float | None" = None, profile: KeepProfile = DEFAULT_PROFILE,
 ) -> ComboRange:
     """按一个翻后动作收缩范围。
 
@@ -108,7 +137,7 @@ def narrow(
     返回**新的** `ComboRange`，不改原来的——同一个范围会被不同分支反复用到，
     就地改会串台。
     """
-    share = keep if keep is not None else _default_keep(kind)
+    share = keep if keep is not None else profile.keep_for(kind)
     notes = list(current.confidence)
 
     if share >= 1.0:
@@ -125,7 +154,9 @@ def narrow(
             "折算档次是拍的，没有实测支撑"
         )
 
-    ranked = sorted(live, key=lambda combo: _strength(combo, board), reverse=True)
+    ranked = sorted(
+        live, key=lambda combo: _strength(combo, board, profile.draw_tier), reverse=True
+    )
     # **`max(1, ...)` 就是「不许收成空」那条保护本身**，不是防御性的凑数：
     # 哪怕 share 给到 0，也至少留下最强的那一手。空范围会让下游的权益计算除零，
     # 或者更糟——悄悄给出一个看着正常的数。
@@ -141,17 +172,8 @@ def narrow(
     return ComboRange(weights=weights, confidence=notes)
 
 
-def _default_keep(kind: str) -> float:
-    if kind in ("bet", "raise"):
-        return KEEP_ON_BET
-    if kind == "call":
-        return KEEP_ON_CALL
-    if kind == "check":
-        return KEEP_ON_CHECK
-    raise ValueError(f"不认识的动作：{kind}")
-
-
-def _strength(combo: "tuple[int, int]", board: "tuple[int, ...]") -> "tuple[int, int]":
+def _strength(combo: "tuple[int, int]", board: "tuple[int, ...]",
+              draw_tier: int = PAIR) -> "tuple[int, int]":
     """这手牌在这个牌面上有多强。越大越强，用作排序键。
 
     返回 `(有效档次, 原始分)`：
@@ -167,10 +189,10 @@ def _strength(combo: "tuple[int, int]", board: "tuple[int, ...]") -> "tuple[int,
     made = score_category(raw)
     if len(board) >= 5:
         return (made, raw)          # 河牌：牌已发完，听牌不是牌力
-    return (max(made, _draw_tier(cards)), raw)
+    return (max(made, _draw_tier(cards, draw_tier)), raw)
 
 
-def _draw_tier(cards: "tuple[int, ...]") -> int:
+def _draw_tier(cards: "tuple[int, ...]", tier_value: int = PAIR) -> int:
     """把听牌折算成一个「相当于第几档成手」的数。
 
     **只认强听牌**（同花听牌、开口顺听）：它们的权益够格跟一对掰腕子。
@@ -190,13 +212,13 @@ def _draw_tier(cards: "tuple[int, ...]") -> int:
         suits[card % 4] += 1
         ranks |= 1 << (card // 4)
     if max(suits) == 4:             # 恰好 4 张同花色＝听同花（5 张就是成手了）
-        tier = PAIR
+        tier = tier_value
 
     # 顺子听牌：把 A 同时当 1（轮子）；任意 5 连窗口里凑齐 4 张就算
     wheel = ranks | ((ranks >> 12) & 1)
     for low in range(0, 10):
         window = (wheel >> low) & 0b11111
         if bin(window).count("1") == 4:
-            tier = max(tier, PAIR)
+            tier = max(tier, tier_value)
             break
     return tier

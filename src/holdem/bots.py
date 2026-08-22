@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from .actions import Action, bet, call, check, fold, raise_to
 from .equity import equity_vs_range, monte_carlo_equity
 from .history import action_records
-from .postflop_ranges import expand, narrow
+from .postflop_ranges import DEFAULT_PROFILE, KeepProfile, expand, narrow
 from .range_tracking import NotCovered, flop_ranges
 from .preflop_policy import (
     PolicyDecision,
@@ -123,6 +123,7 @@ class Bot:
         seed: int | None = None,
         policy: "PreflopPolicySet | PreflopTablePolicy | None" = None,
         range_aware: bool = True,
+        keep_profile: "KeepProfile | None" = None,
     ) -> None:
         if isinstance(style, str):
             if style not in STYLES:
@@ -144,6 +145,8 @@ class Bot:
         `nit` 风格，它的 WTSD 仍是 64%（跟 tag 一模一样）——**风格参数根本控制不了
         翻后的跟注松紧**，43% 那个数是调风格达不到的。
         """
+        self.keep_profile = keep_profile or DEFAULT_PROFILE
+        """收缩参数。**这几个数至今是拍的**（ADR-0008），做成可注入是为了拿批量对局扫。"""
         self.range_hits = 0
         """真用上范围权益的翻后决策数。"""
         self.range_misses = 0
@@ -303,7 +306,8 @@ class Bot:
             if record.kind not in ("bet", "raise", "call", "check"):
                 continue
             street_board = board[: 3 + max(0, record.street - 1)]
-            current = narrow(current, street_board, record.kind)
+            current = narrow(current, street_board, record.kind,
+                             profile=self.keep_profile)
 
         return equity_vs_range(
             hand.hole[seat],
