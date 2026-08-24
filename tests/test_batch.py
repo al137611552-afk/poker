@@ -292,12 +292,84 @@ def test_bad_configurations_are_rejected():
 
 
 def test_report_lists_every_seat(played):
+    """报表拆成翻前/翻后两张之后，**每个座位在两张表里都要有一行**。"""
     lines = played.report().splitlines()
-    assert len(lines) == 2 + 6, "两行表头 + 每个座位一行"
     assert "bb/100" in lines[1]
     assert all(str(seat.seat) in lines[2 + seat.seat] for seat in played.seats)
+
+    postflop_header = next(i for i, line in enumerate(lines) if "持续下注" in line)
+    for seat in played.seats:
+        assert str(seat.seat) in lines[postflop_header + 1 + seat.seat]
 
 
 def test_an_empty_merge_is_an_error():
     with pytest.raises(ValueError, match="没有结果"):
         merge([])
+
+
+# ------------------------------------------------------------------ 报表里的新指标（FR-7）
+
+
+def test_the_report_has_a_preflop_table_and_a_postflop_table():
+    """挤成一行十三列谁也看不清；而且这两组本来就是分开看的（PT4/HM3 也这么分）。"""
+    result = run_batch(MatchConfig(styles=("tag",) * 6, hands=300, seed=5))
+    text = result.report()
+    assert "弃3bet" in text and "持续下注" in text and "AF" in text
+    assert text.count("座位") == 2, "两张表各一个表头"
+
+
+def test_new_metrics_show_a_dash_when_there_was_no_chance():
+    """**没机会就显示「—」，不是 0%。**
+
+    「从没面对过 3bet」和「面对 3bet 从不弃牌」压成同一个 0% 就分不开了。
+    既有那几个指标返回 0 是历史口径（不动它们，改了历史报表不可比），
+    新加的这几个按 `stats.Chance` 的规矩来。
+    """
+    seat = SeatStats(seat=0, style="tag")
+    assert seat.fold_to_threebet is None
+    assert seat.cbet is None
+    assert seat.aggression_factor is None, "一次没跟注过时 AF 不是无穷大"
+
+    seat.cbet_chances, seat.cbet_hands = 4, 1
+    assert seat.cbet == pytest.approx(0.25)
+
+
+def test_the_new_metrics_survive_shard_merging():
+    """分片合并不能把新指标漏掉——漏了的话并行跑出来的报表会少一截。
+
+    **比的是「合并 == 各片之和」，不是「合并 == 一口气跑」**：
+    分片会换种子与起始按钮位，牌局本来就不同（`shard` 的文档说的是
+    位置分布一样，不是牌一样）。第一版就是这么断错的。
+    """
+    config = MatchConfig(styles=("tag",) * 6, hands=400, seed=11)
+    parts = [run_batch(part) for part in shard(config, 2)]
+    expected = {
+        seat: (
+            sum(p.seats[seat].cbet_chances for p in parts),
+            sum(p.seats[seat].postflop_calls for p in parts),
+            sum(p.seats[seat].fold_to_cbet_hands for p in parts),
+        )
+        for seat in range(6)
+    }
+    merged = parts[0]
+    for other in parts[1:]:
+        merged.add(other)
+    for seat in range(6):
+        got = merged.seats[seat]
+        assert (got.cbet_chances, got.postflop_calls, got.fold_to_cbet_hands) == expected[seat]
+
+
+def test_report_metrics_match_the_stats_module():
+    """报表里的数必须与 `stats.py` 算的一致——两处对不上就是搬运搬错了。"""
+    from holdem.stats import StatLine, accumulate
+
+    config = MatchConfig(styles=("tag",) * 6, hands=300, seed=7)
+    lines = {}
+    result = run_batch(config, on_hand=lambda i, h: accumulate(h, lines))
+    for seat_stats in result.seats:
+        line = lines.get(seat_stats.seat)
+        if line is None:
+            continue
+        assert seat_stats.cbet_chances == line.cbet_flop.chances
+        assert seat_stats.cbet_hands == line.cbet_flop.hits
+        assert seat_stats.postflop_aggressive == line.postflop_aggressive

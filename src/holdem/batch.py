@@ -147,6 +147,14 @@ class SeatStats:
     table_decisions: int = 0
     """照范围表走的翻前决策数。"""
     fallback_decisions: int = 0
+    fold_to_threebet_chances: int = 0
+    fold_to_threebet_hands: int = 0
+    cbet_chances: int = 0
+    cbet_hands: int = 0
+    fold_to_cbet_chances: int = 0
+    fold_to_cbet_hands: int = 0
+    postflop_aggressive: int = 0
+    postflop_calls: int = 0
     range_decisions: int = 0
     """翻后**真用上**对手范围算权益的决策数（FR-11）。"""
     range_missed: int = 0
@@ -201,6 +209,35 @@ class SeatStats:
         return self._ratio(self.showdown_wins, self.showdowns)
 
     @property
+    def fold_to_threebet(self) -> "float | None":
+        return self._rate_or_none(self.fold_to_threebet_hands, self.fold_to_threebet_chances)
+
+    @property
+    def cbet(self) -> "float | None":
+        return self._rate_or_none(self.cbet_hands, self.cbet_chances)
+
+    @property
+    def fold_to_cbet(self) -> "float | None":
+        return self._rate_or_none(self.fold_to_cbet_hands, self.fold_to_cbet_chances)
+
+    @property
+    def aggression_factor(self) -> "float | None":
+        """AF＝（翻后下注＋加注）/ 跟注。**一次没跟注过就是 `None`，不是无穷大**。"""
+        if not self.postflop_calls:
+            return None
+        return self.postflop_aggressive / self.postflop_calls
+
+    @staticmethod
+    def _rate_or_none(part: int, whole: int) -> "float | None":
+        """**没机会就返回 `None`，不返回 0**。
+
+        既有那几个指标（`vpip`/`open_rate`…）返回 0 是历史口径，不动它们——
+        改了会让历史报表不可比。但新加的这几个按 `stats.Chance` 的规矩来：
+        「从没面对过 3bet」和「面对 3bet 从不弃牌」压成同一个 0% 就分不开了。
+        """
+        return part / whole if whole else None
+
+    @property
     def solve_coverage(self) -> float:
         """翻前决策里有多大比例是照解走的（其余落在规则兜底上）。"""
         return self._ratio(
@@ -250,7 +287,9 @@ class BatchResult:
         lines = [
             f"{self.hands:,} 手 · {self.config.num_seats} 人 · "
             f"起始 {self.config.start_stack / bb:g}bb · 摊牌 {self.showdown_rate:.1%}",
-            "座位 风格         bb/100 (95%)      VPIP   PFR  开牌  3bet  WTSD  W$SD  照解",
+            # **拆成翻前/翻后两张表**：挤成一行十三列谁也看不清，
+            # 而且这两组本来就是分开看的（PT4/HM3 的界面也这么分）。
+            "座位 风格         bb/100 (95%)      VPIP   PFR  开牌  3bet 弃3bet  照解",
         ]
         for seat in self.seats:
             value = seat.bb_per_100(bb)
@@ -261,8 +300,19 @@ class BatchResult:
                 f"{seat.seat:>2d}   {label}{' ' * max(0, 8 - 2 * len(label))}"
                 f"{value:>9.2f} ±{margin:>6.2f}"
                 f"{seat.vpip:>8.1%}{seat.pfr:>6.1%}{seat.open_rate:>6.1%}"
-                f"{seat.threebet:>6.1%}{seat.wtsd:>6.1%}{seat.won_at_showdown:>6.1%}"
+                f"{seat.threebet:>6.1%}{_pct(seat.fold_to_threebet):>7}"
                 f"{seat.solve_coverage:>6.1%}"
+            )
+
+        lines.append("")
+        lines.append("座位 翻后        持续下注 弃于CB  WTSD  W$SD     AF")
+        for seat in self.seats:
+            label = STYLES[seat.style].label
+            lines.append(
+                f"{seat.seat:>2d}   {label}{' ' * max(0, 8 - 2 * len(label))}"
+                f"{_pct(seat.cbet):>10}{_pct(seat.fold_to_cbet):>7}"
+                f"{seat.wtsd:>6.1%}{seat.won_at_showdown:>6.1%}"
+                f"{_af(seat.aggression_factor):>7}"
             )
         return "\n".join(lines)
 
@@ -348,6 +398,14 @@ def _collect(hand: HandState, stats: list[SeatStats]) -> int:
         entry.flops += line.wtsd.chances
         entry.showdowns += line.wsd.chances
         entry.showdown_wins += line.wsd.hits
+        entry.fold_to_threebet_chances += line.fold_to_threebet.chances
+        entry.fold_to_threebet_hands += line.fold_to_threebet.hits
+        entry.cbet_chances += line.cbet_flop.chances
+        entry.cbet_hands += line.cbet_flop.hits
+        entry.fold_to_cbet_chances += line.fold_to_cbet_flop.chances
+        entry.fold_to_cbet_hands += line.fold_to_cbet_flop.hits
+        entry.postflop_aggressive += line.postflop_aggressive
+        entry.postflop_calls += line.postflop_calls
 
     return len(records)
 
@@ -396,3 +454,12 @@ def merge(results: "list[BatchResult] | tuple[BatchResult, ...]") -> BatchResult
     for other in rest:
         total.add(other)
     return total
+
+
+def _pct(value: "float | None") -> str:
+    """百分比，**没机会时显示「—」而不是 0%**（见 `SeatStats._rate_or_none`）。"""
+    return "—" if value is None else f"{value:.1%}"
+
+
+def _af(value: "float | None") -> str:
+    return "—" if value is None else f"{value:.2f}"
