@@ -174,6 +174,20 @@
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
 
+  /* ---- 水平评级（FR-14）---- */
+  .rt-score { font-size: 34px; font-weight: 700; font-family: var(--mono); }
+  .rt-score.pending { font-size: 15px; font-weight: 600; color: var(--muted); }
+  .rt-why { font-size: 12.5px; color: var(--muted); margin: 4px 0 14px; }
+  .rt-track { padding: 10px 0; border-top: 1px solid var(--line); }
+  .rt-name { font-size: 13.5px; font-weight: 600; }
+  .rt-line { display: flex; align-items: baseline; gap: 8px; margin-top: 4px;
+    font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .rt-line b { color: var(--text); font-weight: 600; }
+  .rt-bar { height: 6px; background: var(--surface-2); border-radius: 3px;
+    overflow: hidden; margin-top: 6px; }
+  .rt-bar span { display: block; height: 100%; background: var(--accent); }
+  .rt-note { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
+
   /* ---- 复盘（FR-9）---- */
   .rv-step { padding: 10px 0; border-top: 1px solid var(--line); }
   .rv-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -249,10 +263,16 @@
     <h1>德扑训练台</h1>
     <span class="meta" id="handMeta"></span>
     <span class="spacer"></span>
+    <button class="link-btn" id="ratingToggle">水平</button>
     <button class="link-btn" id="reviewToggle">复盘</button>
     <button class="link-btn" id="trainToggle">场景训练</button>
     <button class="link-btn" id="setupToggle">牌桌设置</button>
   </header>
+
+  <section class="panel hidden" id="rating">
+    <h2>水平评级</h2>
+    <div id="ratingBody"></div>
+  </section>
 
   <section class="panel hidden" id="review">
     <h2>复盘</h2>
@@ -733,6 +753,82 @@ function noteEl(text) {
   return el;
 }
 
+
+// ---------------------------------------------------------------- 水平评级（FR-14）
+
+async function refreshRating() {
+  const box = $("ratingBody");
+  box.innerHTML = "";
+  let data;
+  try {
+    data = await api("/api/rating");
+  } catch (error) {
+    box.textContent = error.message;
+    return;
+  }
+
+  const score = document.createElement("div");
+  if (data.score === null) {
+    // **样本不够就不给分**：一个建在两百手上的「评级」比没有评级更有害
+    score.className = "rt-score pending";
+    score.textContent = "还不能评级";
+  } else {
+    score.className = "rt-score";
+    score.textContent = data.score.toFixed(1);
+  }
+  const why = document.createElement("div");
+  why.className = "rt-why";
+  why.textContent = data.why;
+  box.append(score, why);
+
+  box.appendChild(track("测验轨（场景训练）", [
+    [`答了 ${data.quiz.answered} 题`, `需要 ${data.quiz.need}`],
+    [`照解走 ${data.quiz.onSolution}`, `明显错误 ${data.quiz.blunders}`],
+  ], data.quiz.answered / data.quiz.need, data.quiz.score));
+
+  box.appendChild(track("对局轨（方差缩减后）", [
+    [`打了 ${data.play.hands} 手`, `需要 ${data.play.need}`],
+    [`原始 ${data.play.rawBb100.toFixed(1)} bb/100`,
+     `调整后 ${data.play.adjustedBb100.toFixed(1)}`],
+    [`全下按权益结算 ${data.play.adjustedHands} 手`,
+     `别人全下 ${data.play.allInWithoutHero} 手`],
+  ], data.play.hands / data.play.need, data.play.score));
+
+  const note = document.createElement("div");
+  note.className = "rt-note";
+  // 折算规则是拍的，要说出来；真比强弱看 bb/100 那个有单位的量
+  note.textContent =
+    "分数是把 bb/100 与答题正确率折成 0~100 再各取一半，折算规则是拍的——" +
+    "真要比强弱请看「调整后 bb/100」，那才是有单位的量。";
+  box.appendChild(note);
+}
+
+function track(name, rows, progress, score) {
+  const el = document.createElement("div");
+  el.className = "rt-track";
+  const head = document.createElement("div");
+  head.className = "rt-name";
+  head.textContent = name + (score === null ? "" : `　${score.toFixed(1)} 分`);
+  el.appendChild(head);
+  rows.forEach(([left, right]) => {
+    const line = document.createElement("div");
+    line.className = "rt-line";
+    const a = document.createElement("b");
+    a.textContent = left;
+    const b = document.createElement("span");
+    b.textContent = right;
+    line.append(a, b);
+    el.appendChild(line);
+  });
+  const bar = document.createElement("div");
+  bar.className = "rt-bar";
+  const fill = document.createElement("span");
+  fill.style.width = Math.min(100, Math.round(progress * 100)) + "%";
+  bar.appendChild(fill);
+  el.appendChild(bar);
+  return el;
+}
+
 async function api(path, options) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -1052,6 +1148,11 @@ async function init() {
     if (!panel.classList.contains("hidden") && !trainKinds.length) initTraining();
   };
   $("trainDeal").onclick = dealTraining;
+  $("ratingToggle").onclick = () => {
+    const panel = $("rating");
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) refreshRating();
+  };
   $("reviewToggle").onclick = () => {
     const panel = $("review");
     panel.classList.toggle("hidden");

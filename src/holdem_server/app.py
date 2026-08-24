@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from holdem import training
 from holdem.actions import Action, call, check, fold, raise_to
 from holdem.bots import STYLES
+from holdem.rating import MIN_HANDS, MIN_QUIZ, QuizTrack, rate
 from holdem.cards import card_to_str
 from holdem.store import HandStore
 
@@ -29,6 +30,10 @@ from .table import MAX_SEATS, MIN_SEATS, SeatConfig, TableConfig, TableSession
 
 STATIC_DIR = Path(__file__).parent / "static"
 BOT_STEP_DELAY = 0.55  # 秒；纯粹为了让人看清对手的动作
+
+RATING_HAND_LIMIT = 5000
+"""评级一次最多重放多少手。**重放每手都要把牌局重走一遍**，不封顶的话
+一次请求能把几万手全跑一遍，界面就卡在那儿了。"""
 
 
 class SeatRequest(BaseModel):
@@ -71,8 +76,11 @@ class TrainingManager:
     一次一道题，不做多题并发。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store_of) -> None:
         self.current = None
+        self.store_of = store_of
+        """取当前 `HandStore` 的回调。**不在构造时拿**：牌桌还没建时 store 是 None，
+        而训练不需要牌桌——拿死了就永远存不进去。"""
 
     def deal(self, request: TrainingDealRequest):
         from holdem.preflop_policy import DEFEND, OPEN, VS_RERAISE
@@ -138,7 +146,35 @@ class TrainingManager:
         if verdict is None:
             # **说不了就说不了**：表里没有这一格时不编一个分数出来
             return {"graded": False, "why": "翻前范围表里没有这一格，判不了"}
+        # 判卷的**结论**落库（FR-14 测验轨的原料）。存不下来不该让答题失败
+        # ——训练本身是可用的，统计只是附带——**但必须说出来**。
+        #
+        # 这里第一版写的是 `except Exception: pass`，然后它**吞掉了一个真 bug**：
+        # SQLite 跨线程报错，答题一条都没存进去，而接口一切正常、测验轨永远是 0。
+        # 静默吞异常最坏的地方就在这儿：功能坏了，症状却是「没有症状」。
+        saved = True
+        save_error = None
+        try:
+            store = self.store_of()
+            if store is None:
+                saved = False
+                save_error = "还没有数据库（先建一张牌桌），这次答题没记进测验轨"
+            else:
+                store.record_answer(
+                    kind=spot.spot.kind, hero=spot.spot.hero,
+                    villain=spot.spot.reraiser or spot.spot.opener,
+                    hole="".join(card_to_str(c) for c in spot.hand.hole[spot.hero_seat]),
+                    taken=verdict.taken, best=verdict.best,
+                    frequency=verdict.frequency,
+                    on_solution=verdict.on_solution, blunder=verdict.blunder,
+                )
+        except Exception as exc:
+            saved = False
+            save_error = f"这次答题没记进测验轨：{exc}"
+
         return {
+            "saved": saved,
+            "saveError": save_error,
             "graded": True,
             "verdict": verdict.verdict,
             "frequency": verdict.frequency,
@@ -269,7 +305,7 @@ def create_app(
     if bot_delay is None:
         bot_delay = float(os.environ.get("HOLDEM_BOT_DELAY", BOT_STEP_DELAY))
     manager = TableManager(db_path, bot_delay)
-    trainer = TrainingManager()
+    trainer = TrainingManager(lambda: manager.store)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -335,6 +371,46 @@ def create_app(
     @app.post("/api/training/answer")
     def training_answer(request: TrainingAnswerRequest) -> dict:
         return trainer.answer(request)
+
+    @app.get("/api/rating")
+    def get_rating() -> dict:
+        """水平评级（FR-14）：测验轨从答题记录来，对局轨从落库的牌重放来。"""
+        store = manager.store
+        if store is None:
+            raise HTTPException(status_code=409, detail="还没有数据库（先建一张牌桌）")
+
+        answered, on_solution, blunders = store.quiz_track()
+        quiz = QuizTrack(answered=answered, on_solution=on_solution, blunders=blunders)
+
+        session = manager.session
+        big_blind = session.config.big_blind if session else 10
+        hero = session.hero_seat if session else 0
+        # 对局轨要重放落库的牌——**重放是有代价的**（每手要重走一遍），
+        # 所以给个上限，别让一次请求把几万手全跑一遍。
+        hands = list(store.replay_hands(limit=RATING_HAND_LIMIT))
+        rating = rate(quiz=quiz, hands=hands, seat=hero, big_blind=big_blind)
+
+        return {
+            "score": rating.score,
+            "why": rating.why,
+            "quiz": {
+                "answered": quiz.answered,
+                "onSolution": quiz.on_solution,
+                "blunders": quiz.blunders,
+                "accuracy": quiz.accuracy,
+                "score": quiz.score,
+                "need": MIN_QUIZ,
+            },
+            "play": {
+                "hands": rating.play.hands,
+                "rawBb100": rating.play.raw_bb100,
+                "adjustedBb100": rating.play.adjusted_bb100,
+                "adjustedHands": rating.play.adjusted_hands,
+                "allInWithoutHero": rating.play.allin_without_hero,
+                "score": rating.play.score,
+                "need": MIN_HANDS,
+            },
+        }
 
     @app.get("/api/hud")
     async def get_hud(scope: str = "session") -> dict:

@@ -173,15 +173,41 @@ def test_persists_to_disk_and_reopens(tmp_path):
         assert loads(phh_texts[0]).is_complete
 
 
-def test_schema_version_mismatch_is_loud(tmp_path):
-    path = tmp_path / "old.sqlite"
+def test_a_newer_database_is_refused(tmp_path):
+    """**比程序还新的库要拒绝打开**：字段可能已经改了语义，硬读会给出错的数。"""
+    path = tmp_path / "future.sqlite"
     HandStore(path).close()
     conn = sqlite3.connect(path)
     conn.execute("UPDATE schema_info SET version = ?", (SCHEMA_VERSION + 1,))
     conn.commit()
     conn.close()
-    with pytest.raises(RuntimeError, match="版本不匹配"):
+    with pytest.raises(RuntimeError, match="比程序还新"):
         HandStore(path)
+
+
+def test_an_older_database_is_upgraded_in_place(tmp_path):
+    """**旧库直接升级**，不报错也不丢数据。
+
+    v1→v2 是纯增量（只加了 `quiz_answers` 一张表），所以能这么升；
+    将来若有破坏性变更，不能照抄这条路。这条用例连带守住「老数据还在」。
+    """
+    path = tmp_path / "old.sqlite"
+    with HandStore(path) as store:
+        session = store.create_session("升级前", small_blind=5, big_blind=10)
+        hand = _play([1000] * 6, button=0, actions=[fold()] * 5)
+        store.save_hand(hand, session_id=session, players=SIX_MAX)
+
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE schema_info SET version = 1")
+    conn.execute("DROP TABLE quiz_answers")
+    conn.commit()
+    conn.close()
+
+    with HandStore(path) as upgraded:
+        version = upgraded.conn.execute("SELECT version FROM schema_info").fetchone()
+        assert version["version"] == SCHEMA_VERSION
+        assert upgraded.count_hands() == 1, "老数据一个字节都不该动"
+        assert upgraded.quiz_track() == (0, 0, 0), "新表建出来了，只是还没有记录"
 
 
 def test_deleting_a_hand_cascades(store):
@@ -282,3 +308,55 @@ def test_stats_can_be_split_by_position(store):
     stats = store.player_stats(session_id=session, by_position=True)
     assert ("bot3", "UTG") in stats
     assert stats[("bot3", "UTG")].rfi.hits == 1
+
+
+# ------------------------------------------------------------------ 测验轨（FR-14）
+
+
+def test_quiz_answers_are_stored_with_the_verdict_not_just_the_action(store):
+    """**存判卷的结论，不只存动作。**
+
+    判卷依赖范围表，表以后会重算；那时拿旧答题按新表重判会得出不同结论——
+    而用户看到的「我当时答对了」应该是当时那张表说的。
+    """
+    store.record_answer(kind="开牌", hero="UTG", villain=None, hole="AhKh",
+                        taken="加注到 2.5bb", best="加注到 2.5bb", frequency=0.92,
+                        on_solution=True, blunder=False)
+    store.record_answer(kind="开牌", hero="UTG", villain=None, hole="7c2d",
+                        taken="加注到 2.5bb", best="弃牌", frequency=0.0,
+                        on_solution=False, blunder=True)
+    assert store.quiz_track() == (2, 1, 1)
+
+
+def test_quiz_track_can_be_filtered_by_scenario(store):
+    store.record_answer(kind="开牌", hero="UTG", villain=None, hole="AhKh",
+                        taken="x", best="x", frequency=1.0, on_solution=True, blunder=False)
+    store.record_answer(kind="面对开牌", hero="BB", villain="BTN", hole="7c2d",
+                        taken="y", best="z", frequency=0.0, on_solution=False, blunder=True)
+    assert store.quiz_track(kind="开牌") == (1, 1, 0)
+    assert store.quiz_track(kind="面对开牌") == (1, 0, 1)
+
+
+def test_replaying_stored_hands_gives_back_playable_states(store):
+    session = store.create_session("重放", small_blind=5, big_blind=10)
+    for _ in range(3):
+        hand = _play([1000] * 6, button=0, actions=[fold()] * 5)
+        store.save_hand(hand, session_id=session, players=SIX_MAX)
+    replayed = list(store.replay_hands(session_id=session))
+    assert len(replayed) == 3
+    assert all(h.result is not None for h in replayed), "重放出来的必须是打完的牌"
+
+
+def test_a_broken_row_does_not_take_down_the_whole_batch(store):
+    """一手牌谱有问题不该让「看看我的评级」整个失败。"""
+    session = store.create_session("坏行", small_blind=5, big_blind=10)
+    hand = _play([1000] * 6, button=0, actions=[fold()] * 5)
+    store.save_hand(hand, session_id=session, players=SIX_MAX)
+    store.conn.execute(
+        "INSERT INTO hands (session_id, hand_no, played_at, num_seats, button,"
+        " small_blind, big_blind, ante, board, pot, went_to_showdown, phh)"
+        " VALUES (?, 99, '2026-01-01', 6, 0, 5, 10, 0, '', 0, 0, '这不是牌谱')",
+        (session,),
+    )
+    store.conn.commit()
+    assert len(list(store.replay_hands(session_id=session))) == 1, "坏的跳过，好的照给"

@@ -12,19 +12,20 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .cards import cards_from_str, cards_to_str
 from .history import ActionRecord, action_records
-from .phh import to_phh
+from .phh import loads as phh_loads, to_phh
 from .positions import position_of
 from .metrics import bb_per_100
 from .stats import HandFacts, accumulate_facts
 from .state import HandState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -93,6 +94,21 @@ CREATE TABLE IF NOT EXISTS hand_actions (
     PRIMARY KEY (hand_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS quiz_answers (
+    id           INTEGER PRIMARY KEY,
+    answered_at  TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    hero         TEXT NOT NULL,
+    villain      TEXT,
+    hole         TEXT NOT NULL,
+    taken        TEXT NOT NULL,
+    best         TEXT NOT NULL,
+    frequency    REAL NOT NULL,
+    on_solution  INTEGER NOT NULL,
+    blunder      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quiz_time ON quiz_answers (answered_at);
 CREATE INDEX IF NOT EXISTS idx_hands_session ON hands (session_id, hand_no);
 CREATE INDEX IF NOT EXISTS idx_players_name ON hand_players (player);
 CREATE INDEX IF NOT EXISTS idx_actions_player ON hand_actions (player, street);
@@ -118,16 +134,30 @@ class HandStore:
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
-        self.conn = sqlite3.connect(self.path)
+        # **允许跨线程**：FastAPI 把同步路由扔进线程池，而这个连接建在主线程，
+        # 默认的 `check_same_thread=True` 会直接报错（2026-08-24 踩到，
+        # 而且当时被一个 `except: pass` 吞掉了，症状是「测验轨永远是 0」）。
+        # 本工具单人本地使用，并发极低，用一把锁把对外的读写包住就够了。
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._lock = threading.RLock()
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
         row = self.conn.execute("SELECT version FROM schema_info").fetchone()
         if row is None:
             self.conn.execute("INSERT INTO schema_info (version) VALUES (?)", (SCHEMA_VERSION,))
-        elif row["version"] != SCHEMA_VERSION:
+        elif row["version"] < SCHEMA_VERSION:
+            # **v1 → v2 是纯增量**（只加了 `quiz_answers` 一张新表），
+            # 上面的 `CREATE TABLE IF NOT EXISTS` 已经把它建好了，所以直接改版本号。
+            #
+            # 将来若有**破坏性**变更（改列、改语义），不能照抄这条路——
+            # 那时要写真正的迁移，并且**先备份**。这里之所以敢直接升，
+            # 是因为老数据一个字节都没动。
+            self.conn.execute("UPDATE schema_info SET version = ?", (SCHEMA_VERSION,))
+        elif row["version"] > SCHEMA_VERSION:
             raise RuntimeError(
-                f"数据库结构版本不匹配：文件是 v{row['version']}，程序需要 v{SCHEMA_VERSION}"
+                f"数据库结构版本比程序还新：文件是 v{row['version']}，"
+                f"程序只认到 v{SCHEMA_VERSION}——用新版程序打开它"
             )
         self.conn.commit()
 
@@ -307,6 +337,61 @@ class HandStore:
             showdowns=int(row["showdowns"]),
             big_blind=int(row["big_blind"]),
         )
+
+    def record_answer(
+        self, *, kind: str, hero: str, villain: "str | None", hole: str,
+        taken: str, best: str, frequency: float, on_solution: bool, blunder: bool,
+    ) -> int:
+        """记一道场景训练的答题（FR-14 测验轨的原料）。
+
+        **判卷的结论存下来，而不是只存动作**：判卷依赖范围表，表以后会重算，
+        那时旧答题按新表重判会得出不同结论——而用户看到的「我当时答对了」应该
+        是当时那张表说的。存结论也让统计不必每次重新查表。
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO quiz_answers (answered_at, kind, hero, villain, hole,"
+            " taken, best, frequency, on_solution, blunder)"
+            " VALUES (:at, :kind, :hero, :villain, :hole, :taken, :best,"
+            " :freq, :on_solution, :blunder)",
+            {
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "kind": kind, "hero": hero, "villain": villain, "hole": hole,
+                "taken": taken, "best": best, "freq": float(frequency),
+                "on_solution": int(on_solution), "blunder": int(blunder),
+            },
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def quiz_track(self, *, kind: "str | None" = None) -> "tuple[int, int, int]":
+        """测验轨的三个计数：答了多少、照解走多少、明显错误多少。"""
+        clause = "" if kind is None else " WHERE kind = :kind"
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS answered,"
+            " COALESCE(SUM(on_solution), 0) AS on_solution,"
+            " COALESCE(SUM(blunder), 0) AS blunders"
+            f" FROM quiz_answers{clause}",
+            {"kind": kind},
+        ).fetchone()
+        return int(row["answered"]), int(row["on_solution"]), int(row["blunders"])
+
+    def replay_hands(self, *, session_id: "int | None" = None, limit: "int | None" = None):
+        """把落库的牌谱重放成 `HandState`，**最近的在前**。
+
+        存的是 PHH 原文（那是唯一事实来源），所以这里走 `phh.loads` 重放，
+        不另存一份解析结果——两份表示迟早会漂。
+
+        **重放不了的那手跳过，不让它带垮整批**：一手牌谱有问题（比如手工改过）
+        不该让「看看我的评级」整个失败。跳过多少条由调用方从数量差里看得出来。
+        """
+        clause = "" if session_id is None else " WHERE session_id = :session"
+        sql = ("SELECT phh FROM hands" + clause +
+               " ORDER BY id DESC" + (f" LIMIT {int(limit)}" if limit else ""))
+        for row in self.conn.execute(sql, {"session": session_id}).fetchall():
+            try:
+                yield phh_loads(row["phh"])
+            except Exception:
+                continue
 
     def player_stats(
         self, *, session_id: "int | None" = None, players: "tuple[str, ...] | None" = None,

@@ -353,3 +353,52 @@ def test_review_follows_the_latest_hand(client):
     _play_some_hands(client, count=1)
     second = client.get("/api/review").json()
     assert second["handNo"] > first["handNo"]
+
+
+# ------------------------------------------------------------------ 评级（FR-14）
+
+
+def test_answering_a_quiz_reports_whether_it_was_recorded(client):
+    """**答题必须报告存没存进去。**
+
+    这条守的是一个被 `except Exception: pass` 吞掉过的真 bug：SQLite 跨线程报错，
+    答题一条都没存进去，而接口一切正常、测验轨永远是 0。
+    静默吞异常最坏的地方就在这儿——功能坏了，症状却是「没有症状」。
+    """
+    client.post("/api/table", json=six_max_payload())
+    client.post("/api/training/deal", json={"kind": "开牌", "hero": "UTG"})
+    body = client.post("/api/training/answer", json={"kind": "fold"}).json()
+    assert body["saved"] is True, body.get("saveError")
+
+
+def test_answers_accumulate_into_the_quiz_track(client):
+    client.post("/api/table", json=six_max_payload())
+    for _ in range(3):
+        client.post("/api/training/deal", json={"kind": "开牌", "hero": "BTN"})
+        client.post("/api/training/answer", json={"kind": "fold"})
+    quiz = client.get("/api/rating").json()["quiz"]
+    assert quiz["answered"] == 3
+    assert quiz["onSolution"] + quiz["blunders"] <= 3
+
+
+def test_rating_refuses_a_score_until_both_tracks_have_enough(client):
+    """建在几手牌上的「评级」比没有评级更有害。"""
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client, count=1)
+    body = client.get("/api/rating").json()
+    assert body["score"] is None
+    assert "还差" in body["why"]
+    assert body["play"]["need"] > body["play"]["hands"]
+
+
+def test_rating_reports_both_the_raw_and_the_adjusted_number(client):
+    """两个数都要给——差得远本身就是信息（说明那批牌运气成分大）。"""
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client, count=2)
+    play = client.get("/api/rating").json()["play"]
+    assert "rawBb100" in play and "adjustedBb100" in play
+    assert play["hands"] >= 1
+
+
+def test_rating_needs_a_database(client):
+    assert client.get("/api/rating").status_code == 409
