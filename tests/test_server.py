@@ -304,3 +304,52 @@ def test_dealing_again_replaces_the_current_spot(client):
     second = client.post("/api/training/deal", json={"kind": "开牌", "hero": "BTN"}).json()
     assert second["hero"]["position"] == "BTN" != first["hero"]["position"]
     assert client.get("/api/training/current").json()["hero"]["position"] == "BTN"
+
+
+# ------------------------------------------------------------------ 复盘（FR-9）
+
+
+def test_review_before_anything_is_played(client):
+    assert client.get("/api/review").status_code == 409
+    client.post("/api/table", json=six_max_payload())
+    assert client.get("/api/review").status_code == 409, "建了桌但没打牌，照样没得复盘"
+
+
+def test_review_reports_the_preflop_decisions(client):
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client, count=1)
+    body = client.get("/api/review").json()
+
+    assert len(body["heroCards"]) == 2
+    assert isinstance(body["preflop"], list)
+    for step in body["preflop"]:
+        assert step["position"] and step["action"]
+        # 底池与待跟额记的是**那一刻**的，不是终局的
+        assert step["potBefore"] >= 0 and step["toCall"] >= 0
+        if step["graded"]:
+            assert 0.0 <= step["frequency"] <= 1.0
+            assert step["best"] in step["weights"]
+
+
+def test_review_says_plainly_when_there_is_no_solver(client):
+    """**没装求解器就如实说**，不降级成一个看着差不多的数。
+
+    PRD 的「不得冒充精确解」防的就是这个：翻后 EV 损失算不了时，
+    给一句「没装」比给一个来路不明的数字有用得多。
+    """
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client, count=1)
+    postflop = client.get("/api/review").json()["postflop"]
+    assert isinstance(postflop["available"], bool)
+    if not postflop["available"]:
+        assert "没装求解器" in postflop["why"]
+
+
+def test_review_follows_the_latest_hand(client):
+    """复盘的是**刚打完**那手，不是第一手——否则打了十手还在看第一手。"""
+    client.post("/api/table", json=six_max_payload())
+    _play_some_hands(client, count=1)
+    first = client.get("/api/review").json()
+    _play_some_hands(client, count=1)
+    second = client.get("/api/review").json()
+    assert second["handNo"] > first["handNo"]

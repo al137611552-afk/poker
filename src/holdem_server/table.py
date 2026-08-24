@@ -17,6 +17,7 @@ from holdem.bots import DEFAULT_STYLE, STYLES, Bot
 from holdem.cards import card_to_str
 from holdem.deck import shuffled_deck
 from holdem.positions import position_of
+from holdem.preflop_review import review_preflop
 from holdem.state import COMPLETE, STREET_NAMES, HandConfig, HandState
 from holdem.store import HandStore
 
@@ -233,6 +234,65 @@ class TableSession:
 
     # ------------------------------------------------------------ 视图
 
+    def review(self) -> dict:
+        """复盘**刚打完**那手牌（FR-9）。
+
+        分两层，因为它们的精度不一样，**不能并排成一列数**：
+
+        - **翻前**：用离线解好的范围表判频率分。不依赖求解器，装没装都有。
+        - **翻后**：EV 损失要真解局面（`holdem_solver.review`）。没装求解器就
+          如实说「没装」，**不降级成一个看着差不多的数**——那正是 PRD 的
+          「不得冒充精确解」要防的事。
+        """
+        hand = self.hand
+        if hand is None or hand.result is None:
+            # 抛普通异常、由路由层转成 HTTP 状态码：**这一层不该认识 fastapi**
+            # （牌桌逻辑要能脱离 web 单测，那是 CLAUDE.md 的分层约定）
+            raise LookupError("还没有打完的牌可复盘")
+
+        hero = self.hero_seat
+        preflop: list = []
+        note = None
+        try:
+            steps = review_preflop(hand, hero)
+        except Exception as exc:                 # 表缺失、重放对不上……
+            steps = []
+            note = f"翻前复盘做不了：{exc}"
+        for step in steps:
+            verdict = step.verdict
+            preflop.append({
+                "index": step.index,
+                "position": step.position,
+                "potBefore": step.pot_before,
+                "toCall": step.to_call,
+                "action": step.action,
+                "graded": step.graded,
+                "verdict": verdict.verdict if verdict else "表里没有这一格，判不了",
+                "frequency": verdict.frequency if verdict else None,
+                "best": verdict.best if verdict else None,
+                "taken": verdict.taken if verdict else None,
+                "blunder": step.blunder,
+                "weights": dict(verdict.weights) if verdict else {},
+            })
+
+        return {
+            "handNo": self.hand_no,
+            "heroSeat": hero,
+            "heroCards": [card_to_str(c) for c in hand.hole[hero]],
+            "board": [card_to_str(c) for c in hand.board],
+            "net": hand.result.net[hero],
+            "preflop": preflop,
+            "preflopNote": note,
+            # 翻后那半的门在这儿。**判据是「有没有求解器」，不是「要不要试试」**——
+            # 试了再失败会让用户等上几十秒才看到一句「没装」。
+            "postflop": {
+                "available": _solver_ready(),
+                "why": None if _solver_ready() else
+                       "没装求解器（TEXAS_SOLVER_HOME），翻后 EV 损失算不了；"
+                       "翻前那半照常给",
+            },
+        }
+
     def hud(self, *, scope: str = "session") -> dict:
         """牌桌浮层要的统计（FR-8）。口径来自 `stats.py`，这里一行都不重算。
 
@@ -409,3 +469,16 @@ def _hud_metrics(line) -> list:
         "calls": line.postflop_calls if line else 0,
     })
     return out
+
+
+def _solver_ready() -> bool:
+    """本机有没有可用的求解器。**导入放在函数里**：`holdem_solver` 不是这个包的
+    硬依赖，顶层导入会让没装求解器的机器连牌桌都起不来。"""
+    try:
+        from holdem_solver.backend import TexasSolver
+    except Exception:
+        return False
+    try:
+        return TexasSolver.available()
+    except Exception:
+        return False

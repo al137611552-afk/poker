@@ -174,6 +174,23 @@
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
 
+  /* ---- 复盘（FR-9）---- */
+  .rv-step { padding: 10px 0; border-top: 1px solid var(--line); }
+  .rv-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .rv-pos { font-family: var(--mono); font-size: 11px; color: var(--accent);
+    letter-spacing: .06em; }
+  .rv-act { font-size: 13.5px; font-weight: 600; }
+  .rv-ctx { font-family: var(--mono); font-size: 11px; color: var(--muted);
+    margin-left: auto; }
+  .rv-verdict { font-size: 12.5px; margin-top: 4px; }
+  .rv-verdict.bad { color: var(--warn); font-weight: 600; }
+  .rv-verdict.good { color: var(--ok, #7bd88f); }
+  /* 判不了的点要看得出来，别跟判得了的混成一片 */
+  .rv-step.ungraded { opacity: .6; }
+  .rv-note { margin-top: 10px; padding: 10px; border-radius: 8px;
+    background: var(--surface-2); font-size: 12.5px; color: var(--muted); }
+  .rv-scale { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
+
   /* ---- 场景训练（FR-12）---- */
   .train-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
   .train-actions button { min-height: 44px; padding: 0 20px; }   /* 触屏目标 */
@@ -232,9 +249,16 @@
     <h1>德扑训练台</h1>
     <span class="meta" id="handMeta"></span>
     <span class="spacer"></span>
+    <button class="link-btn" id="reviewToggle">复盘</button>
     <button class="link-btn" id="trainToggle">场景训练</button>
     <button class="link-btn" id="setupToggle">牌桌设置</button>
   </header>
+
+  <section class="panel hidden" id="review">
+    <h2>复盘</h2>
+    <div class="meta" id="reviewMeta"></div>
+    <div id="reviewBody"></div>
+  </section>
 
   <section class="panel hidden" id="training">
     <h2>场景训练</h2>
@@ -613,6 +637,102 @@ function showTrainingResult(result) {
   box.appendChild(note);
 }
 
+
+// ---------------------------------------------------------------- 复盘（FR-9）
+
+async function refreshReview() {
+  const meta = $("reviewMeta");
+  const body = $("reviewBody");
+  body.innerHTML = "";
+  let data;
+  try {
+    data = await api("/api/review");
+  } catch (error) {
+    meta.textContent = error.message;
+    return;
+  }
+
+  const net = data.net > 0 ? `+${data.net}` : String(data.net);
+  meta.textContent =
+    `第 ${data.handNo} 手 · 你的牌 ${data.heroCards.join(" ")} · 净额 ${net}`;
+
+  if (data.preflopNote) {
+    body.appendChild(noteEl(data.preflopNote));
+  }
+  if (!data.preflop.length && !data.preflopNote) {
+    body.appendChild(noteEl("这手牌你翻前没有做过决策（比如大盲直接过牌）。"));
+  }
+
+  data.preflop.forEach((step) => {
+    const el = document.createElement("div");
+    el.className = "rv-step" + (step.graded ? "" : " ungraded");
+
+    const head = document.createElement("div");
+    head.className = "rv-head";
+    const pos = document.createElement("span");
+    pos.className = "rv-pos";
+    pos.textContent = `#${step.index} ${step.position}`;
+    const act = document.createElement("span");
+    act.className = "rv-act";
+    act.textContent = step.action;
+    const ctx = document.createElement("span");
+    ctx.className = "rv-ctx";
+    ctx.textContent = `底池 ${step.potBefore}` + (step.toCall ? ` · 待跟 ${step.toCall}` : "");
+    head.append(pos, act, ctx);
+    el.appendChild(head);
+
+    const verdict = document.createElement("div");
+    verdict.className = "rv-verdict" +
+      (step.blunder ? " bad" : step.graded && step.frequency > 0.5 ? " good" : "");
+    verdict.textContent = step.verdict;
+    el.appendChild(verdict);
+
+    // 判得了的点才画分布；判不了的只留那句话，别画一个空图
+    if (step.graded) {
+      Object.entries(step.weights)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([label, weight]) => {
+          const row = document.createElement("div");
+          row.className = "train-bar" + (label === step.taken ? " taken" : "");
+          const name = document.createElement("span");
+          name.className = "name";
+          name.textContent = label;
+          const track = document.createElement("span");
+          track.className = "track";
+          const fill = document.createElement("span");
+          fill.className = "fill";
+          fill.style.width = Math.round(weight * 100) + "%";
+          track.appendChild(fill);
+          const value = document.createElement("span");
+          value.textContent = Math.round(weight * 100) + "%";
+          row.append(name, track, value);
+          el.appendChild(row);
+        });
+    }
+    body.appendChild(el);
+  });
+
+  // 翻后那半：没装求解器就把原话显示出来，**不留空**——
+  // 空着会让人以为「翻后没问题」，而实际上是根本没算
+  if (!data.postflop.available) {
+    body.appendChild(noteEl(data.postflop.why));
+  }
+
+  const scale = document.createElement("div");
+  scale.className = "rv-scale";
+  // 两半的精度不同，必须说清楚：并排放着很容易被当成同一把尺子
+  scale.textContent =
+    "翻前给的是「解给各动作的频率」（范围表里没有 EV）；翻后的 EV 损失要真解局面，两者不是同一把尺子。";
+  body.appendChild(scale);
+}
+
+function noteEl(text) {
+  const el = document.createElement("div");
+  el.className = "rv-note";
+  el.textContent = text;
+  return el;
+}
+
 async function api(path, options) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -898,7 +1018,11 @@ function connect() {
     render();
     // 统计只在**一手打完**之后才变，所以只在"刚刚结束"的那一刻拉一次，
     // 不跟着每条广播走（那会把一份基本不动的数据请求几十遍）
-    if (previous && previous.inProgress && !state.inProgress) refreshHud();
+    if (previous && previous.inProgress && !state.inProgress) {
+      refreshHud();
+      // 复盘面板开着就跟着刷新——**刚打完那一刻正是想看的时候**
+      if (!$("review").classList.contains("hidden")) refreshReview();
+    }
   };
   socket.onclose = () => setTimeout(connect, 1500);
 }
@@ -928,6 +1052,11 @@ async function init() {
     if (!panel.classList.contains("hidden") && !trainKinds.length) initTraining();
   };
   $("trainDeal").onclick = dealTraining;
+  $("reviewToggle").onclick = () => {
+    const panel = $("review");
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) refreshReview();
+  };
   $("btnFold").onclick = () => send("fold");
   $("btnCheckCall").onclick = (e) => send(e.currentTarget.dataset.kind);
   $("btnRaise").onclick = () => {

@@ -298,6 +298,15 @@ def create_app(
     async def get_state() -> dict:
         return manager.require_session().view()
 
+    @app.get("/api/review")
+    async def get_review() -> dict:
+        """复盘刚打完那手牌（FR-9）。翻前总有，翻后看有没有装求解器。"""
+        session = manager.require_session()
+        try:
+            return session.review()
+        except LookupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/training/scenarios")
     def training_scenarios() -> dict:
         """有哪些场景可练。位置表来自引擎，不在前端写死。"""
