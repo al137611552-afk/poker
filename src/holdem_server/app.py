@@ -19,7 +19,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from holdem import training
+from holdem.actions import Action, call, check, fold, raise_to
 from holdem.bots import STYLES
+from holdem.cards import card_to_str
 from holdem.store import HandStore
 
 from .table import MAX_SEATS, MIN_SEATS, SeatConfig, TableConfig, TableSession
@@ -46,6 +49,120 @@ class TableRequest(BaseModel):
 class ActionRequest(BaseModel):
     kind: str
     amount: int | None = None
+
+
+class TrainingDealRequest(BaseModel):
+    kind: str = "开牌"
+    hero: str = "UTG"
+    villain: str | None = None
+    """面对开牌时是开牌者，面对再加注时是 3bet 的人；开牌场景用不到。"""
+
+
+class TrainingAnswerRequest(BaseModel):
+    kind: str
+    to: int | None = None
+
+
+class TrainingManager:
+    """场景训练的当前题目（FR-12）。
+
+    **题目存在服务端**：判卷要拿着那手牌去查表，让前端把整个牌局传回来既笨重
+    又给了它篡改的机会——练习的意义就是判卷说了算。本工具是单人本地使用，
+    一次一道题，不做多题并发。
+    """
+
+    def __init__(self) -> None:
+        self.current = None
+
+    def deal(self, request: TrainingDealRequest):
+        from holdem.preflop_policy import DEFEND, OPEN, VS_RERAISE
+
+        try:
+            if request.kind == OPEN:
+                self.current = training.deal_open(request.hero)
+            elif request.kind == DEFEND:
+                self.current = training.deal_defend(request.hero, request.villain or "")
+            elif request.kind == VS_RERAISE:
+                self.current = training.deal_threebet(request.hero, request.villain or "")
+            else:
+                raise HTTPException(status_code=422, detail=f"不认识的场景：{request.kind}")
+        except ValueError as exc:                       # 位置名写错之类
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:                     # 造题造出了别的场景
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return self.view()
+
+    def require(self):
+        if self.current is None:
+            raise HTTPException(status_code=409, detail="还没有题目，先发一道")
+        return self.current
+
+    def view(self) -> dict:
+        spot = self.require()
+        hand = spot.hand
+        legal = hand.legal_actions()
+        big_blind = hand.config.big_blind
+        return {
+            "label": spot.label,
+            "kind": spot.spot.kind,
+            "hero": {
+                "position": spot.spot.hero,
+                "seat": spot.hero_seat,
+                "cards": [card_to_str(c) for c in hand.hole[spot.hero_seat]],
+            },
+            "opener": spot.spot.opener,
+            "reraiser": spot.spot.reraiser,
+            "pot": hand.pot_size,
+            "bigBlind": big_blind,
+            # 合法动作原样给出去：前端**不该自己推**加注的上下界，
+            # 那是引擎的判断，猜一份出来会让界面允许打不出来的动作
+            "legal": {
+                "canFold": legal.can_fold,
+                "canCheck": legal.can_check,
+                "canCall": legal.can_call,
+                "callCost": legal.call_cost,
+                "callTo": legal.call_to,
+                "canRaise": legal.can_raise,
+                "minRaiseTo": legal.min_raise_to,
+                "maxRaiseTo": legal.max_raise_to,
+            },
+        }
+
+    def answer(self, request: TrainingAnswerRequest) -> dict:
+        spot = self.require()
+        action = _to_action(request)
+        try:
+            verdict = training.grade(spot.hand, action)
+        except ValueError as exc:                       # 非法动作
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if verdict is None:
+            # **说不了就说不了**：表里没有这一格时不编一个分数出来
+            return {"graded": False, "why": "翻前范围表里没有这一格，判不了"}
+        return {
+            "graded": True,
+            "verdict": verdict.verdict,
+            "frequency": verdict.frequency,
+            "best": verdict.best,
+            "taken": verdict.taken,
+            "blunder": verdict.blunder,
+            "onSolution": verdict.on_solution,
+            "weights": verdict.weights,
+        }
+
+
+def _to_action(request: TrainingAnswerRequest) -> Action:
+    kind = request.kind
+    if kind == "fold":
+        return fold()
+    if kind == "check":
+        return check()
+    if kind == "call":
+        return call()
+    if kind in ("bet", "raise"):
+        if request.to is None:
+            raise HTTPException(status_code=422, detail="加注要给 to（本街投入的目标总额）")
+        return raise_to(request.to)
+    raise HTTPException(status_code=422, detail=f"不认识的动作：{kind}")
 
 
 class TableManager:
@@ -152,6 +269,7 @@ def create_app(
     if bot_delay is None:
         bot_delay = float(os.environ.get("HOLDEM_BOT_DELAY", BOT_STEP_DELAY))
     manager = TableManager(db_path, bot_delay)
+    trainer = TrainingManager()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -179,6 +297,35 @@ def create_app(
     @app.get("/api/state")
     async def get_state() -> dict:
         return manager.require_session().view()
+
+    @app.get("/api/training/scenarios")
+    def training_scenarios() -> dict:
+        """有哪些场景可练。位置表来自引擎，不在前端写死。"""
+        from holdem.positions import position_names
+        from holdem.preflop_policy import DEFEND, OPEN, VS_RERAISE
+
+        return {
+            "positions": list(position_names(6)),
+            "kinds": [
+                {"id": OPEN, "label": "第一个开牌", "needsVillain": False},
+                {"id": DEFEND, "label": "面对开牌", "needsVillain": True,
+                 "villainLabel": "开牌者"},
+                {"id": VS_RERAISE, "label": "开牌后面对再加注", "needsVillain": True,
+                 "villainLabel": "3bet 的人"},
+            ],
+        }
+
+    @app.post("/api/training/deal")
+    def training_deal(request: TrainingDealRequest) -> dict:
+        return trainer.deal(request)
+
+    @app.get("/api/training/current")
+    def training_current() -> dict:
+        return trainer.view()
+
+    @app.post("/api/training/answer")
+    def training_answer(request: TrainingAnswerRequest) -> dict:
+        return trainer.answer(request)
 
     @app.get("/api/hud")
     async def get_hud(scope: str = "session") -> dict:

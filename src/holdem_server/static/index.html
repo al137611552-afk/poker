@@ -174,6 +174,32 @@
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
 
+  /* ---- 场景训练（FR-12）---- */
+  .train-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .train-actions button { min-height: 44px; padding: 0 20px; }   /* 触屏目标 */
+  .train-spot { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .train-spot[hidden], .train-spot.hidden { display: none; }
+  .train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .train-label { font-size: 14px; font-weight: 600; }
+  .train-choices { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .train-choices button { min-height: 44px; padding: 0 16px; }
+  .train-choices input { width: 90px; min-height: 44px; background: var(--surface-2);
+    border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 0 10px;
+    font-family: var(--mono); }
+  .train-result { margin-top: 14px; padding: 12px; border-radius: 8px;
+    background: var(--surface-2); }
+  .train-result.hidden { display: none; }
+  .train-verdict { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  .train-verdict.good { color: var(--ok, #7bd88f); }
+  .train-verdict.bad { color: var(--warn); }
+  .train-bar { display: flex; align-items: center; gap: 8px; margin-top: 4px;
+    font-family: var(--mono); font-size: 12px; }
+  .train-bar .name { min-width: 92px; }
+  .train-bar .track { flex: 1; height: 8px; background: var(--surface); border-radius: 4px;
+    overflow: hidden; }
+  .train-bar .fill { height: 100%; background: var(--accent); }
+  .train-bar.taken .name { color: var(--warn); font-weight: 600; }
+
   /* ---- HUD（FR-8）---- */
   .seat-hud { display: flex; gap: 7px; margin-top: 5px; font-family: var(--mono);
     font-size: 10.5px; color: var(--muted); cursor: pointer; }
@@ -206,8 +232,41 @@
     <h1>德扑训练台</h1>
     <span class="meta" id="handMeta"></span>
     <span class="spacer"></span>
+    <button class="link-btn" id="trainToggle">场景训练</button>
     <button class="link-btn" id="setupToggle">牌桌设置</button>
   </header>
+
+  <section class="panel hidden" id="training">
+    <h2>场景训练</h2>
+    <div class="fields">
+      <div class="field">
+        <label for="trainKind">场景</label>
+        <select id="trainKind"></select>
+      </div>
+      <div class="field">
+        <label for="trainHero">我的位置</label>
+        <select id="trainHero"></select>
+      </div>
+      <div class="field" id="trainVillainField">
+        <label for="trainVillain" id="trainVillainLabel">对手位置</label>
+        <select id="trainVillain"></select>
+      </div>
+    </div>
+    <div class="train-actions">
+      <button id="trainDeal">发一题</button>
+      <span class="meta" id="trainStreak"></span>
+    </div>
+
+    <div class="train-spot hidden" id="trainSpot">
+      <div class="train-head">
+        <span class="train-label" id="trainLabel"></span>
+        <span class="meta" id="trainPot"></span>
+      </div>
+      <div class="seat-cards" id="trainCards"></div>
+      <div class="train-choices" id="trainChoices"></div>
+      <div class="train-result hidden" id="trainResult"></div>
+    </div>
+  </section>
 
   <section class="panel" id="setup">
     <h2>牌桌设置</h2>
@@ -388,6 +447,170 @@ function hideHud() { $("hudModal").hidden = true; }
 async function refreshHud() {
   // 统计一手牌才变一次，所以**不跟着每次动作的广播走**，只在这里主动拉
   try { hud = await api("/api/hud"); render(); } catch (e) { /* 没建桌就没有 HUD */ }
+}
+
+
+// ---------------------------------------------------------------- 场景训练（FR-12）
+
+let trainKinds = [];
+let trainSpot = null;
+let trainStreak = { done: 0, onSolution: 0 };
+
+async function initTraining() {
+  const body = await api("/api/training/scenarios");
+  trainKinds = body.kinds;
+  const kindSel = $("trainKind");
+  kindSel.innerHTML = "";
+  trainKinds.forEach((kind) => {
+    const option = document.createElement("option");
+    option.value = kind.id;
+    option.textContent = kind.label;
+    kindSel.appendChild(option);
+  });
+  ["trainHero", "trainVillain"].forEach((id) => {
+    const sel = $(id);
+    sel.innerHTML = "";
+    body.positions.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = option.textContent = name;
+      sel.appendChild(option);
+    });
+  });
+  $("trainHero").value = "UTG";
+  $("trainVillain").value = "BTN";
+  kindSel.addEventListener("change", syncVillainField);
+  syncVillainField();
+}
+
+function syncVillainField() {
+  const kind = trainKinds.find((k) => k.id === $("trainKind").value);
+  const needs = kind && kind.needsVillain;
+  $("trainVillainField").style.display = needs ? "" : "none";
+  if (needs) $("trainVillainLabel").textContent = kind.villainLabel;
+}
+
+async function dealTraining() {
+  const kind = trainKinds.find((k) => k.id === $("trainKind").value);
+  const payload = { kind: $("trainKind").value, hero: $("trainHero").value };
+  if (kind && kind.needsVillain) payload.villain = $("trainVillain").value;
+  try {
+    trainSpot = await api("/api/training/deal", {
+      method: "POST", body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    $("trainResult").className = "train-result";
+    $("trainResult").textContent = "发不出这道题：" + error.message;
+    return;
+  }
+  renderTrainingSpot();
+}
+
+function renderTrainingSpot() {
+  $("trainSpot").classList.remove("hidden");
+  $("trainResult").classList.add("hidden");
+  $("trainLabel").textContent = trainSpot.label;
+  $("trainPot").textContent =
+    `底池 ${trainSpot.pot} · 盲注 ${trainSpot.bigBlind / 2}/${trainSpot.bigBlind}`;
+
+  const cards = $("trainCards");
+  cards.innerHTML = "";
+  trainSpot.hero.cards.forEach((text) => cards.appendChild(cardEl(text)));
+
+  const choices = $("trainChoices");
+  choices.innerHTML = "";
+  const legal = trainSpot.legal;
+  if (legal.canFold) choices.appendChild(trainButton("弃牌", { kind: "fold" }));
+  if (legal.canCheck) choices.appendChild(trainButton("过牌", { kind: "check" }));
+  if (legal.canCall) {
+    choices.appendChild(trainButton(`跟注 ${legal.callCost}`, { kind: "call" }));
+  }
+  if (legal.canRaise) {
+    // 加注额的上下界**用服务端给的**，不在前端推——那是引擎的判断，
+    // 猜一份出来会让界面允许打不出来的动作
+    const input = document.createElement("input");
+    input.type = "number";
+    input.id = "trainRaiseTo";
+    input.min = legal.minRaiseTo;
+    input.max = legal.maxRaiseTo;
+    input.value = legal.minRaiseTo;
+    choices.appendChild(input);
+    choices.appendChild(trainButton("加注到", null, () => ({
+      kind: "raise", to: Number($("trainRaiseTo").value),
+    })));
+  }
+}
+
+function trainButton(text, payload, build) {
+  const button = document.createElement("button");
+  button.textContent = text;
+  button.addEventListener("click", () => answerTraining(build ? build() : payload));
+  return button;
+}
+
+async function answerTraining(payload) {
+  let result;
+  try {
+    result = await api("/api/training/answer", {
+      method: "POST", body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    showTrainingResult({ error: error.message });
+    return;
+  }
+  showTrainingResult(result);
+}
+
+function showTrainingResult(result) {
+  const box = $("trainResult");
+  box.className = "train-result";
+  box.innerHTML = "";
+
+  if (result.error) {
+    box.textContent = result.error;
+    return;
+  }
+  if (!result.graded) {
+    // **说不了就说不了**：表里没这一格时如实说，不编一个分数
+    box.textContent = result.why;
+    return;
+  }
+
+  trainStreak.done += 1;
+  if (result.onSolution) trainStreak.onSolution += 1;
+  $("trainStreak").textContent =
+    `本轮 ${trainStreak.done} 题，照解走 ${trainStreak.onSolution}`;
+
+  const verdict = document.createElement("div");
+  verdict.className = "train-verdict " + (result.blunder ? "bad" : result.onSolution ? "good" : "");
+  verdict.textContent = result.verdict;
+  box.appendChild(verdict);
+
+  // 完整分布画成条：**判词只有三档，条形图才看得出差多少**
+  const entries = Object.entries(result.weights).sort((a, b) => b[1] - a[1]);
+  entries.forEach(([label, weight]) => {
+    const row = document.createElement("div");
+    row.className = "train-bar" + (label === result.taken ? " taken" : "");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = label;
+    const track = document.createElement("span");
+    track.className = "track";
+    const fill = document.createElement("span");
+    fill.className = "fill";
+    fill.style.width = Math.round(weight * 100) + "%";
+    track.appendChild(fill);
+    const value = document.createElement("span");
+    value.textContent = Math.round(weight * 100) + "%";
+    row.append(name, track, value);
+    box.appendChild(row);
+  });
+
+  const note = document.createElement("div");
+  note.className = "meta";
+  note.style.marginTop = "8px";
+  // 这句不能省：翻前表里没有 EV，给的是频率分。不说清楚，用户会把它当 EV 损失读
+  note.textContent = "这是解给各动作的频率，不是 EV 损失——翻前范围表里没有 EV。";
+  box.appendChild(note);
 }
 
 async function api(path, options) {
@@ -697,6 +920,14 @@ async function init() {
 
   $("createTable").onclick = createTable;
   $("setupToggle").onclick = () => $("setup").classList.toggle("hidden");
+  // 场景训练**不需要牌桌**（它是独立的翻前练习），所以监听挂在这里而不是
+  // `connect()` 里——挂在那儿的话，一进页面还没建桌时点它没反应。
+  $("trainToggle").onclick = () => {
+    const panel = $("training");
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden") && !trainKinds.length) initTraining();
+  };
+  $("trainDeal").onclick = dealTraining;
   $("btnFold").onclick = () => send("fold");
   $("btnCheckCall").onclick = (e) => send(e.currentTarget.dataset.kind);
   $("btnRaise").onclick = () => {

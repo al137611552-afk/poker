@@ -242,3 +242,65 @@ def test_hud_is_not_pushed_with_every_state_broadcast(client):
     client.post("/api/table", json=six_max_payload())
     view = client.get("/api/state").json()
     assert "hud" not in view and "stats" not in view
+
+
+# ------------------------------------------------------------------ 场景训练（FR-12）
+
+
+def test_training_scenarios_come_from_the_engine(client):
+    """位置表不在前端写死——引擎改了座位命名，界面得跟着变。"""
+    body = client.get("/api/training/scenarios").json()
+    assert "UTG" in body["positions"] and "BTN" in body["positions"]
+    assert {k["id"] for k in body["kinds"]} == {"开牌", "面对开牌", "面对再加注"}
+
+
+def test_answering_before_dealing_is_refused(client):
+    assert client.get("/api/training/current").status_code == 409
+    assert client.post("/api/training/answer", json={"kind": "fold"}).status_code == 409
+
+
+def test_a_dealt_spot_carries_everything_the_ui_needs(client):
+    body = client.post("/api/training/deal", json={"kind": "开牌", "hero": "UTG"}).json()
+    assert body["hero"]["position"] == "UTG"
+    assert len(body["hero"]["cards"]) == 2
+    assert body["pot"] > 0
+    # **合法动作由引擎给，前端不该自己推**：猜一份出来会让界面允许打不出来的动作
+    legal = body["legal"]
+    assert legal["canRaise"] and legal["minRaiseTo"] < legal["maxRaiseTo"]
+
+
+def test_an_illegal_raise_is_refused_with_a_reason(client):
+    """判卷的前提是这确实是个可选项，否则评的不是决策、是笔误。"""
+    client.post("/api/training/deal", json={"kind": "面对开牌", "hero": "BB",
+                                            "villain": "BTN"})
+    response = client.post("/api/training/answer", json={"kind": "raise", "to": 11})
+    assert response.status_code == 422
+    assert "不合法" in response.json()["detail"]
+
+
+def test_a_raise_without_an_amount_is_refused(client):
+    client.post("/api/training/deal", json={"kind": "开牌", "hero": "CO"})
+    assert client.post("/api/training/answer", json={"kind": "raise"}).status_code == 422
+
+
+def test_grading_returns_the_whole_distribution(client):
+    client.post("/api/training/deal", json={"kind": "开牌", "hero": "BTN"})
+    body = client.post("/api/training/answer", json={"kind": "fold"}).json()
+    assert body["graded"] is True
+    assert body["weights"] and body["best"] in body["weights"]
+    assert 0.0 <= body["frequency"] <= 1.0
+
+
+def test_an_unknown_scenario_or_position_is_refused(client):
+    assert client.post("/api/training/deal",
+                       json={"kind": "跳舞", "hero": "UTG"}).status_code == 422
+    assert client.post("/api/training/deal",
+                       json={"kind": "开牌", "hero": "楼上"}).status_code == 422
+
+
+def test_dealing_again_replaces_the_current_spot(client):
+    """一次一道题：发了新的，旧的就该判不了了（否则会对着上一题打分）。"""
+    first = client.post("/api/training/deal", json={"kind": "开牌", "hero": "UTG"}).json()
+    second = client.post("/api/training/deal", json={"kind": "开牌", "hero": "BTN"}).json()
+    assert second["hero"]["position"] == "BTN" != first["hero"]["position"]
+    assert client.get("/api/training/current").json()["hero"]["position"] == "BTN"
