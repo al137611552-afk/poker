@@ -192,3 +192,92 @@ TURBO_SNG_9 = Structure(
     entrants=9,
 )
 """最常见的 SNG 结构，用来跑通链路；真要练某个赛事请自己填 `Structure`。"""
+
+
+# ------------------------------------------------------------------ ICM 口径的推弃收益
+
+
+def icm_push_fold_payoffs(
+    stacks: "dict[str, int]", payouts: "tuple[float, ...]", *,
+    hero: str, villain: str, big_blind: int, ante: int = 0, prize_pool: float = 1.0,
+):
+    """把推弃的七个终局折成 **ICM 收益**，喂给 `pushfold.solve_push_fold`。
+
+    `hero` 是小盲、`villain` 是大盲，两人之间推弃；桌上其他人这手牌不参与，
+    只交前注。
+
+    ## 为什么值得做
+
+    筹码口径下「+EV 就该推」，ICM 口径下常常不该：泡沫圈上赢了多拿一点点，
+    输了直接归零。**两个口径的答案会相反**，而现金桌那套直觉在这里是错的。
+
+    ## 七个数与牌类无关
+
+    终局只有「弃 / 偷到 / 摊牌赢 / 摊牌输」这几种，牌类只影响权益。
+    所以 ICM 在这里只算七次，CFR 内部一次都不用重算——不然每步每类都要递归一遍。
+
+    ## 单位
+
+    返回的收益单位是**奖金**（`prize_pool` 给什么就是什么）。
+    所以解出来的可利用度也是奖金单位，**别拿它跟筹码口径的 bb/手比大小**。
+
+    ## ⚠ 已知偏差：这是**单手** ICM，会系统性偏紧
+
+    它只问「这一手推还是不推」，**假定不打就没事**。真实的锦标赛里不打也在流血——
+    盲注每圈都要交，5bb 的筹码熬不过几圈。
+
+    实测这个偏差有多大：三人都有奖时，短筹码的推范围从筹码口径的 71.6% 掉到
+    **11.7%**——那是「反正保住第三名」的逻辑推到极端。照这个打会被盲注吃死。
+
+    严肃工具（HoldemResources 那类）用的是**未来博弈**模型：把后续几手的盲注压力
+    一并算进去。我们没有那个。**所以这里的输出适合用来看「方向」
+    （ICM 比筹码口径紧多少），不适合直接当作开牌表照抄。**
+    """
+    from .pushfold import Payoffs
+
+    if hero not in stacks or villain not in stacks:
+        raise ValueError("英雄或对手不在筹码表里")
+    if stacks[hero] <= 0 or stacks[villain] <= 0:
+        raise ValueError("推弃的双方都得还有筹码")
+
+    others = [name for name in stacks if name not in (hero, villain)]
+    dead = ante * len(others)
+    """其他人交的前注——这手牌他们赢不到，所以那部分钱归本手的赢家。"""
+
+    hero_blind = big_blind // 2 + ante
+    villain_blind = big_blind + ante
+    effective = min(stacks[hero] - ante, stacks[villain] - ante)
+
+    def board(hero_delta: int, villain_delta: int) -> dict:
+        out = dict(stacks)
+        out[hero] = stacks[hero] + hero_delta
+        out[villain] = stacks[villain] + villain_delta
+        for name in others:
+            out[name] = stacks[name] - ante
+        return out
+
+    def icm_of(who: str, table: dict) -> float:
+        return icm_equity(table, payouts, prize_pool).get(who, 0.0)
+
+    now = board(0, 0)
+    now_hero, now_villain = icm_of(hero, now), icm_of(villain, now)
+
+    # 小盲弃：他的盲注与前注归大盲，其他人的前注也归大盲
+    folded = board(-hero_blind, +hero_blind + dead)
+    # 小盲全下、大盲弃：大盲的盲注与前注归小盲
+    stolen = board(+villain_blind + dead, -villain_blind)
+    # 摊牌：赢家拿走对方投进去的（有效筹码 + 他的前注）以及其他人的死钱。
+    # **写成最简形式**——第一版把盲注加加减减地摊在式子里，等价但看不懂，
+    # 我自己都得验算一遍才敢确定它对。
+    won = board(+effective + ante + dead, -effective - ante)
+    lost = board(-effective - ante, +effective + ante + dead)
+
+    return Payoffs(
+        sb_fold=icm_of(hero, folded) - now_hero,
+        sb_steal=icm_of(hero, stolen) - now_hero,
+        sb_win=icm_of(hero, won) - now_hero,
+        sb_lose=icm_of(hero, lost) - now_hero,
+        bb_fold=icm_of(villain, stolen) - now_villain,
+        bb_win=icm_of(villain, lost) - now_villain,
+        bb_lose=icm_of(villain, won) - now_villain,
+    )

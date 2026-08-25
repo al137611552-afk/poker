@@ -172,3 +172,82 @@ def test_stack_in_big_blinds_follows_the_clock():
 def test_cost_per_orbit_includes_the_ante():
     level = BlindLevel(75, 150, ante=15)
     assert level.cost_per_orbit == 240
+
+
+# ------------------------------------------------------------------ ICM 口径的推弃
+
+
+def _percent(hand_range) -> float:
+    from holdem.ranges import TOTAL_COMBOS, class_combo_count
+
+    return sum(
+        hand_range.weight(i) * class_combo_count(i) for i in range(169)
+    ) / TOTAL_COMBOS * 100
+
+
+def _solve_both(stacks, hero="hero", villain="villain", big_blind=200):
+    from holdem.pushfold import solve_push_fold
+    from holdem.tournament import icm_push_fold_payoffs
+
+    effective = min(stacks[hero], stacks[villain]) / big_blind
+    chips = solve_push_fold(effective, iterations=300)
+    payoffs = icm_push_fold_payoffs(
+        stacks, PAY_3, hero=hero, villain=villain, big_blind=big_blind, prize_pool=100
+    )
+    return chips, solve_push_fold(effective, iterations=300, payoffs=payoffs)
+
+
+def test_icm_pushes_and_calls_tighter_than_chip_ev():
+    """**这就是接 ICM 的全部意义**：同一个局面，两个口径给出不同的范围。
+
+    泡沫圈上输了直接归零、赢了只多拿一点，所以 ICM 口径必然更紧。
+    """
+    chips, icm = _solve_both({"hero": 1000, "villain": 4000, "big": 5000, "other": 5000})
+    assert _percent(icm.push) < _percent(chips.push)
+    assert _percent(icm.call) < _percent(chips.call)
+
+
+def test_the_closer_to_the_money_the_tighter_icm_gets():
+    """人越少、奖金越近，出局的代价越大。"""
+    _, bubble = _solve_both({"hero": 1000, "villain": 4000, "big": 5000, "other": 5000})
+    _, in_money = _solve_both({"hero": 1000, "villain": 4000, "big": 5000})
+    assert _percent(in_money.push) < _percent(bubble.push)
+
+
+def test_the_single_hand_icm_bias_is_documented_not_hidden():
+    """**单手 ICM 会紧到离谱**（实测三人都有奖时推范围掉到 11.7%），
+
+    因为它假定「不打就没事」——而真实锦标赛里不打也在被盲注吃。
+    这条偏差必须写在模块文档里：照这个数直接当开牌表会输死。
+    """
+    from holdem import tournament
+
+    doc = tournament.icm_push_fold_payoffs.__doc__
+    assert "偏紧" in doc and "盲注" in doc
+    assert "不适合直接当作开牌表照抄" in doc
+
+    _, in_money = _solve_both({"hero": 1000, "villain": 4000, "big": 5000})
+    assert _percent(in_money.push) < 25.0, "偏差确实存在，不是文档里的假设"
+
+
+def test_icm_payoffs_are_asymmetric_where_chip_payoffs_are_not():
+    """筹码口径下赢 +S / 输 −S 是对称的；ICM 下输得更多——不对称正是它的价值。"""
+    from holdem.pushfold import chip_payoffs
+    from holdem.tournament import icm_push_fold_payoffs
+
+    chips = chip_payoffs(5.0, 0.0)
+    assert chips.sb_win == pytest.approx(-chips.sb_lose)
+
+    icm = icm_push_fold_payoffs(
+        {"hero": 1000, "villain": 4000, "big": 5000, "other": 5000},
+        PAY_3, hero="hero", villain="villain", big_blind=200, prize_pool=100,
+    )
+    assert abs(icm.sb_lose) > icm.sb_win, "输的代价大于赢的收益"
+
+
+def test_both_sides_must_still_have_chips():
+    from holdem.tournament import icm_push_fold_payoffs
+
+    with pytest.raises(ValueError, match="都得还有筹码"):
+        icm_push_fold_payoffs({"hero": 0, "villain": 4000}, PAY_3,
+                              hero="hero", villain="villain", big_blind=200)

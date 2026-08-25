@@ -70,12 +70,54 @@ class PushFoldSolution:
         return self.call.percent()
 
 
+@dataclass(frozen=True)
+class Payoffs:
+    """七个终局各值多少。**单位由口径决定**：筹码口径下是大盲，ICM 口径下是奖金。
+
+    把收益抽出来，是为了让同一个 CFR 内核既能解「筹码 EV 口径」也能解
+    「ICM 口径」——**锦标赛里这两者的答案常常相反**（泡沫圈上筹码 EV 为正的全下，
+    ICM 下是负的）。
+
+    **这七个数与牌类无关**，牌类只影响权益。所以 ICM 只要在求解前算七次，
+    CFR 内部一次都不用重算——不然每步每类都算一遍 ICM，那是几十万次递归。
+    """
+
+    sb_fold: float
+    """小盲弃牌。"""
+    sb_steal: float
+    """小盲全下、大盲弃牌。"""
+    sb_win: float
+    """摊牌小盲赢。"""
+    sb_lose: float
+    """摊牌小盲输。"""
+    bb_fold: float
+    """大盲面对全下弃牌。"""
+    bb_win: float
+    """摊牌大盲赢。"""
+    bb_lose: float
+    """摊牌大盲输。"""
+
+
+def chip_payoffs(effective_stack: float, ante: float) -> Payoffs:
+    """筹码口径（大盲/手）。这是现金桌与「不考虑奖金」时的默认。"""
+    return Payoffs(
+        sb_fold=-(ante + 0.5),
+        sb_steal=ante + 1.0,
+        sb_win=effective_stack,
+        sb_lose=-effective_stack,
+        bb_fold=-(ante + 1.0),
+        bb_win=effective_stack,
+        bb_lose=-effective_stack,
+    )
+
+
 class _Game:
     """把权益表与共牌权重预处理成按行组织的向量，让每一步只做点积。"""
 
-    __slots__ = ("stack", "ante", "removal_rows", "weighted_rows", "totals")
+    __slots__ = ("stack", "ante", "pay", "removal_rows", "weighted_rows", "totals")
 
-    def __init__(self, stack: float, ante: float) -> None:
+    def __init__(self, stack: float, ante: float, pay: Payoffs) -> None:
+        self.pay = pay
         equity = equity_matrix()
         removal = removal_weights()
         self.stack = stack
@@ -97,13 +139,15 @@ class _Game:
         called = sum(map(mul, self.removal_rows[hero], call_probs))
         total = self.totals[hero]
         if called <= 0:
-            return self.ante + 1.0
+            return self.pay.sb_steal
         equity_sum = sum(map(mul, self.weighted_rows[hero], call_probs))
         folded = total - called
+        # 摊牌那部分：赢的权重是 equity_sum，输的是 called − equity_sum。
+        # 筹码口径下这式子化简回原来的 `2S·eq − S·called`（有测试守着等价）。
         return (
-            folded * (self.ante + 1.0)
-            + 2.0 * self.stack * equity_sum
-            - self.stack * called
+            folded * self.pay.sb_steal
+            + equity_sum * self.pay.sb_win
+            + (called - equity_sum) * self.pay.sb_lose
         ) / total
 
     def call_ev(self, hero: int, push_probs: list[float]) -> float:
@@ -111,8 +155,13 @@ class _Game:
         shoved = sum(map(mul, self.removal_rows[hero], push_probs))
         if shoved <= 0:
             return 0.0
+        # `weighted_rows[hero]` 是**按 hero 取行**的，这里 hero 就是大盲——
+        # 所以 equity_sum 已经是**大盲自己的**权益，不用再取补
+        # （第一版在这儿取了补，五条测试当场变红）。
         equity_sum = sum(map(mul, self.weighted_rows[hero], push_probs))
-        return 2.0 * self.stack * (equity_sum / shoved) - self.stack
+        return (
+            equity_sum * self.pay.bb_win + (shoved - equity_sum) * self.pay.bb_lose
+        ) / shoved
 
     def push_chance(self, hero: int, push_probs: list[float]) -> float:
         return sum(map(mul, self.removal_rows[hero], push_probs)) / self.totals[hero]
@@ -131,6 +180,7 @@ def solve_push_fold(
     ante: float = 0.0,
     iterations: int = 600,
     tolerance: float = 1e-4,
+    payoffs: "Payoffs | None" = None,
 ) -> PushFoldSolution:
     """求解给定有效筹码下的推弃均衡。
 
@@ -141,9 +191,10 @@ def solve_push_fold(
     if ante < 0:
         raise ValueError("前注不能为负")
 
-    game = _Game(float(effective_stack), ante)
-    fold_value = -(ante + 0.5)
-    bb_fold_value = -(ante + 1.0)
+    pay = payoffs if payoffs is not None else chip_payoffs(float(effective_stack), ante)
+    game = _Game(float(effective_stack), ante, pay)
+    fold_value = pay.sb_fold
+    bb_fold_value = pay.bb_fold
     classes = range(NUM_HAND_CLASSES)
 
     push_regret_yes = [0.0] * NUM_HAND_CLASSES
