@@ -447,13 +447,79 @@ def group_serve():
                 proc.kill()
 
 
+# ================================================================== I 组 · 重活
+
+
+def group_heavy():
+    """**开发机（2 核 4G）跑不动的那些**，攒到这台大内存机器上跑。
+
+    默认不跑（`--heavy` 或 `--only I` 才跑）：几分钟到几十分钟不等，
+    真解那条更久。
+    """
+    print("\nI 组 · 开发机跑不动的重活（默认不跑）")
+
+    @check("I", "压测：20 万手随机自对弈，筹码守恒且不死循环")
+    def _():
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "soak.py"), "200000"],
+            cwd=ROOT, capture_output=True, text=True, timeout=5400,
+            env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        assert proc.returncode == 0, f"压测失败：{out[-400:]}"
+        return " ".join(out.strip().splitlines()[-2:])[-90:]
+
+    @check("I", "批量对局一万手：统计落在合理区间")
+    def _():
+        from holdem.batch import MatchConfig, run_batch, shard
+        from concurrent.futures import ProcessPoolExecutor
+
+        config = MatchConfig(styles=("tag",) * 6, hands=10000, seed=20260825)
+        parts = shard(config, 4)
+        with ProcessPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(run_batch, parts))
+        merged = results[0]
+        for other in results[1:]:
+            merged.add(other)
+
+        vpip = sum(s.vpip_hands for s in merged.seats) / sum(s.hands for s in merged.seats)
+        wtsd = sum(s.showdowns for s in merged.seats) / max(1, sum(s.flops for s in merged.seats))
+        assert merged.is_zero_sum(), "不抽水的桌子必须零和——挂了说明引擎守恒被破坏"
+        assert 0.15 <= vpip <= 0.23, f"VPIP {vpip:.1%} 偏离 tag 的常态"
+        # 范围感知默认开着，WTSD 该在 40% 上下；60%+ 说明它没生效
+        assert wtsd < 0.55, f"WTSD {wtsd:.1%} 偏高——范围感知多半没生效"
+        return f"VPIP {vpip:.1%} · WTSD {wtsd:.1%} · 零和 ✓"
+
+    @check("I", "漏洞报告真解一批（FR-10，要求解器）")
+    def _():
+        from holdem_solver.backend import TexasSolver
+
+        if not os.environ.get("TEXAS_SOLVER_HOME") or not TexasSolver.supports_evs():
+            raise SkipCheck("求解器不可用——这条要真解，先把 C 组做完")
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "leak_report.py"),
+             "--hands", "300", "--max-solves", "8"],
+            cwd=ROOT, capture_output=True, text=True, timeout=7200,
+            env=dict(os.environ, PYTHONPATH=str(ROOT / "src")),
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        assert proc.returncode == 0, f"跑失败：{out[-500:]}"
+        # 报告里必须有置信度分级那两列，否则 FR-9 的分级没接上
+        assert "A/B/C" in out and "可信漏损" in out, "报告缺置信度分级列"
+        return "报告含 A/B/C 与可信漏损两列"
+
+
 # ================================================================== 主流程
 
 
 GROUPS = {
     "0": group_env, "A": group_hud, "C": group_solver,
     "E": group_training, "F": group_review, "G": group_rating, "H": group_serve,
+    "I": group_heavy,
 }
+
+DEFAULT_GROUPS = "0ACEFGH"
+"""默认跑的组。**I 组（重活）默认不跑**——几分钟到几十分钟不等。"""
 
 MANUAL = [
     ("B", "手机与电脑同一 Wi-Fi，用启动时打印的局域网网址能打开牌桌"),
@@ -473,10 +539,15 @@ MANUAL = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="只跑某几组，如 --only 0AC")
+    ap.add_argument("--heavy", action="store_true",
+                    help="连 I 组（开发机跑不动的重活）一起跑，会久很多")
     ap.add_argument("--json", help="把结果写成 JSON")
     args = ap.parse_args()
 
-    wanted = list(args.only.upper()) if args.only else list(GROUPS)
+    if args.only:
+        wanted = list(args.only.upper())
+    else:
+        wanted = list(DEFAULT_GROUPS) + (["I"] if args.heavy else [])
     print("=" * 70)
     print("德扑训练台 · Windows 自检")
     print("=" * 70)
@@ -508,6 +579,9 @@ def main() -> int:
         print(f"  [ ] [{group}] {text}")
     print("-" * 70)
     print("\n⚠ **脚本全绿不等于验完了** —— 上面那 11 条要人来看。")
+    if not args.heavy and (not args.only or "I" not in args.only.upper()):
+        print("⚠ **I 组（重活）没跑** —— 压测、一万手对局、真解漏洞报告都在里面，"
+              "加 `--heavy` 跑一遍。")
 
     if args.json:
         Path(args.json).write_text(json.dumps(
