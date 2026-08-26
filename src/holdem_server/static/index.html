@@ -43,6 +43,22 @@
   header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .02em; }
   header .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   header .spacer { flex: 1; }
+  /* 标签条：桌面挤在右边，**移动端单独占一行**——挤在「第 N 手 · 盲注」后面
+     会被推成两三行，谁也点不准（2026-08-26 真机反馈）。 */
+  .tabs { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+  .tabs .link-btn.active {
+    color: var(--text); border-color: var(--accent); background: var(--surface-2);
+  }
+  @media (max-width: 720px) {
+    header { row-gap: 10px; }
+    .tabs {
+      order: 3; width: 100%; margin-left: 0;
+      display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+    }
+    .tabs .link-btn {
+      min-height: 44px; padding: 0 4px; font-size: 12.5px; text-align: center;
+    }
+  }
   .link-btn {
     background: none; border: 1px solid var(--line); color: var(--muted);
     border-radius: 4px; padding: 4px 10px; font-size: 12.5px;
@@ -174,6 +190,12 @@
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 18px; }
 
+  .view-note {
+    margin: -4px 0 12px; padding: 9px 12px; border-radius: 8px;
+    background: var(--surface-2); font-size: 12.5px; color: var(--muted);
+  }
+  .view-note[hidden] { display: none; }
+
   /* ---- 水平评级（FR-14）---- */
   .rt-score { font-size: 34px; font-weight: 700; font-family: var(--mono); }
   .rt-score.pending { font-size: 15px; font-weight: 600; color: var(--muted); }
@@ -262,12 +284,16 @@
   <header>
     <h1>德扑训练台</h1>
     <span class="meta" id="handMeta"></span>
-    <span class="spacer"></span>
-    <button class="link-btn" id="ratingToggle">水平</button>
-    <button class="link-btn" id="reviewToggle">复盘</button>
-    <button class="link-btn" id="trainToggle">场景训练</button>
-    <button class="link-btn" id="setupToggle">牌桌设置</button>
+    <nav class="tabs" id="tabs">
+      <button class="link-btn" data-view="table" id="tableToggle">牌桌</button>
+      <button class="link-btn" data-view="rating" id="ratingToggle">水平</button>
+      <button class="link-btn" data-view="review" id="reviewToggle">复盘</button>
+      <button class="link-btn" data-view="training" id="trainToggle">场景训练</button>
+      <button class="link-btn" data-view="setup" id="setupToggle">牌桌设置</button>
+    </nav>
   </header>
+
+  <div class="view-note" id="viewNote" hidden></div>
 
   <section class="panel hidden" id="rating">
     <h2>水平评级</h2>
@@ -829,6 +855,75 @@ function track(name, rows, progress, score) {
   return el;
 }
 
+
+// ---------------------------------------------------------------- 视图切换
+
+// 还没建桌时该看到的是设置面板。**初值不能写 "table"**——那时牌桌是空的，
+// applyView 会把设置面板也藏起来，屏幕上一片空白。
+let currentView = "setup";
+
+/** 各视图对应要显示的元素。牌桌不是单个面板，是三块一起亮/灭。 */
+const VIEWS = {
+  table: ["table", "log", "actionbar"],
+  training: ["training"],
+  review: ["review"],
+  rating: ["rating"],
+  setup: ["setup"],
+};
+
+/** 面板**互斥**，不叠加。
+
+    原先是「点一下展开一个面板」，于是牌局和场景训练能同时摊在屏幕上——
+    一个顶在上面一个压在下面，看着像在抢地盘（2026-08-26 真机反馈）。
+
+    **但牌局并不会因为切走而中断**：它的状态在服务端，切回来接着打。
+    所以这里只管显示，不碰牌局——也就没有「要不要结束当前牌局」这回事。 */
+function setView(name) {
+  currentView = VIEWS[name] ? name : "table";
+  applyView();
+  if (currentView === "training" && !trainKinds.length) initTraining();
+  if (currentView === "review") refreshReview();
+  if (currentView === "rating") refreshRating();
+}
+
+function applyView() {
+  // 没建桌就点「牌桌」：**说一句，别给一片空白**
+  if (currentView === "table" && !state) {
+    currentView = "setup";
+  }
+  Object.entries(VIEWS).forEach(([name, ids]) => {
+    const on = name === currentView;
+    ids.forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      // 牌桌那三块只有在真有牌局时才显示，否则空着更难看
+      const show = on && (name !== "table" || Boolean(state));
+      el.classList.toggle("hidden", !show);
+    });
+  });
+  document.querySelectorAll("#tabs .link-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.view === currentView);
+  });
+  updateViewNote();
+}
+
+/** 离开牌桌时，如果牌局正等着你行动，说一句。
+
+    措辞是**「牌局会等你回来」而不是「要结束当前牌局吗」**——后者暗示不结束
+    就不能训练，那是假的：牌局在服务端好好待着，bot 不会超时。
+    把一件不存在的限制写进提示里，比不提示更糟。 */
+function updateViewNote() {
+  const note = $("viewNote");
+  if (!note) return;
+  const waiting = state && state.inProgress && state.waitingForHuman;
+  const away = currentView !== "table" && currentView !== "setup";
+  note.hidden = !(waiting && away);
+  if (!note.hidden) {
+    note.textContent =
+      `牌桌上第 ${state.handNo} 手正等你行动——它会一直等着，随时点「牌桌」回去接着打。`;
+  }
+}
+
 async function api(path, options) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -897,7 +992,7 @@ async function createTable() {
         ante: parseInt($("ante").value, 10),
       }),
     });
-    $("setup").classList.add("hidden");
+    setView("table");
     await api("/api/hand", { method: "POST" });
   } catch (error) {
     $("setupError").textContent = error.message;
@@ -908,9 +1003,9 @@ async function createTable() {
 
 function render() {
   if (!state) return;
-  $("table").classList.remove("hidden");
-  $("log").classList.remove("hidden");
-  $("actionbar").classList.remove("hidden");
+  // **不再无条件显示牌桌**——视图是互斥的，由 `applyView` 说了算。
+  // 原先这三行每次广播都把牌桌拉回来，人在训练面板里也会被打断。
+  applyView();
   $("handMeta").textContent =
     `第 ${state.handNo} 手 · 盲注 ${state.smallBlind}/${state.bigBlind}`;
 
@@ -1139,25 +1234,13 @@ async function init() {
   buildSeatStyleRows();
 
   $("createTable").onclick = createTable;
-  $("setupToggle").onclick = () => $("setup").classList.toggle("hidden");
-  // 场景训练**不需要牌桌**（它是独立的翻前练习），所以监听挂在这里而不是
-  // `connect()` 里——挂在那儿的话，一进页面还没建桌时点它没反应。
-  $("trainToggle").onclick = () => {
-    const panel = $("training");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden") && !trainKinds.length) initTraining();
-  };
+  // 五个标签统一走 `setView`：**面板互斥、不叠加**。
+  // 监听挂在这里而不是 `connect()` 里——场景训练不需要牌桌，
+  // 挂在那儿的话一进页面还没建桌时点它没反应。
+  document.querySelectorAll("#tabs .link-btn").forEach((btn) => {
+    btn.onclick = () => setView(btn.dataset.view);
+  });
   $("trainDeal").onclick = dealTraining;
-  $("ratingToggle").onclick = () => {
-    const panel = $("rating");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) refreshRating();
-  };
-  $("reviewToggle").onclick = () => {
-    const panel = $("review");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) refreshReview();
-  };
   $("btnFold").onclick = () => send("fold");
   $("btnCheckCall").onclick = (e) => send(e.currentTarget.dataset.kind);
   $("btnRaise").onclick = () => {
@@ -1171,10 +1254,11 @@ async function init() {
   try {
     state = await api("/api/state");
     refreshHud();
-    $("setup").classList.add("hidden");
+    setView("table");
     render();
   } catch (error) {
     // 还没开桌，留在设置面板
+    setView("setup");
   }
 }
 

@@ -199,6 +199,62 @@ def group_hud():
         return "state 里没有统计"
 
 
+def group_frontend():
+    """前端里**能静态验的那部分**。
+
+    布局与手感只能人看，但「标签指向一个不存在的面板」这种断链是可以查的——
+    而且它**不会报错，只会让某个标签点了没反应**。
+    """
+    print("\nA2 组 · 前端静态检查（布局仍需人眼）")
+    import re
+
+    page = (ROOT / "src" / "holdem_server" / "static" / "index.html").read_text(
+        encoding="utf-8")
+
+    @check("A2", "视图表引用的元素都真实存在")
+    def _():
+        match = re.search(r"const VIEWS = \{(.*?)\};", page, re.S)
+        assert match, "找不到 VIEWS 表"
+        ids = re.findall(r'"([a-zA-Z]+)"', match.group(1))
+        missing = [i for i in ids if f'id="{i}"' not in page]
+        assert not missing, f"这些元素不存在：{missing}"
+        return f"{len(ids)} 个元素都在"
+
+    @check("A2", "顶部标签与视图表一一对应")
+    def _():
+        match = re.search(r"const VIEWS = \{(.*?)\};", page, re.S)
+        views = set(re.findall(r"^\s+(\w+): \[", match.group(1), re.M))
+        tabs = set(re.findall(r'data-view="(\w+)"', page))
+        assert views == tabs, f"视图 {sorted(views)} 与标签 {sorted(tabs)} 对不上"
+        return f"{len(tabs)} 个标签"
+
+    @check("A2", "JS 能通过语法检查（需要 node）")
+    def _():
+        import shutil
+
+        node = shutil.which("node")
+        if node is None:
+            raise SkipCheck("本机没有 node，跳过语法检查")
+        match = re.search(r"<script[^>]*>(.*)</script>", page, re.S)
+        tmp = ROOT / "_syntax_check.js"
+        tmp.write_text(match.group(1), encoding="utf-8")
+        try:
+            proc = subprocess.run([node, "--check", str(tmp)],
+                                  capture_output=True, text=True, timeout=60)
+            assert proc.returncode == 0, (proc.stderr or "")[-300:]
+        finally:
+            tmp.unlink(missing_ok=True)
+        return "语法没问题"
+
+    @check("A2", "移动端标签条有独立的一行（不挤在手号后面）")
+    def _():
+        assert "@media (max-width: 720px)" in page, "没有移动端断点"
+        mobile = page[page.index("@media (max-width: 720px)"):][:400]
+        assert "width: 100%" in mobile and "order: 3" in mobile, \
+            "标签条没在移动端换行占满"
+        return "有断点且标签条独占一行"
+
+
 # ================================================================== C 组 · 求解器
 
 
@@ -513,12 +569,12 @@ def group_heavy():
 
 
 GROUPS = {
-    "0": group_env, "A": group_hud, "C": group_solver,
+    "0": group_env, "A": group_hud, "2": group_frontend, "C": group_solver,
     "E": group_training, "F": group_review, "G": group_rating, "H": group_serve,
     "I": group_heavy,
 }
 
-DEFAULT_GROUPS = "0ACEFGH"
+DEFAULT_GROUPS = "0A2CEFGH"
 """默认跑的组。**I 组（重活）默认不跑**——几分钟到几十分钟不等。"""
 
 MANUAL = [
