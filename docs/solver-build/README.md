@@ -26,6 +26,21 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make TexasSolver console_solver -j1      # 开发机 2 核 3.6GB：必须 -j1，并行会顶到内存
 ```
 
+### CMake 4.x 会拒绝这份工程（2026-08-25 Windows 实测）
+
+上游的 `CMakeLists.txt` 声明的最低版本太老，**CMake 4.x 直接报错拒绝配置**。
+加一个策略下限绕开：
+
+```powershell
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+```
+
+PowerShell 里那个参数**要带引号**（`"-DCMAKE_POLICY_VERSION_MINIMUM=3.5"`），
+否则会被拆开。CMake 3.x 不需要这一条。
+
+实测通过的组合：Windows 11 + CMake 4.4.1 + MinGW-w64，`-j 16`，38 个目标，
+产物 `console_solver.exe` 4.5 MB。
+
 编完把二进制与 `resources/` 摆成后端要的样子：
 
 ```bash

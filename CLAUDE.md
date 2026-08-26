@@ -181,6 +181,13 @@ docs/            PRD / ARCHITECTURE / ADR / DEVLOG
   **树里没有的尺度要如实报出来（`LineNotInTree`），不许四舍五入到最近的那个**——
   一个说不清来路的「你亏了 2.3bb」比没有数字更糟。加注尺度不并树（求解器的 raise
   百分比口径没实测过），所以实战的加注对不上时会被跳过。
+- **成规模真解时，解树要用完就扔**（`leak_report.solve_and_score`）：
+  `report = solver.solve(...)` 赋值时**右侧先求值**，新树建好的那一刻旧树还被
+  `report` 指着——峰值是**两棵**。一棵真实局面的解树 dump 3.2GB、解析成 Python 对象
+  十几 GB，两棵就把 32GB 的机器打爆（2026-08-25 Windows 真机：`--max-solves 3`
+  也卡死，不是机器不够）。循环末尾 `del report; gc.collect()`，
+  `tests/test_leak_report_memory.py` 用 weakref 钉着这条。
+  每个局面还会把**当前峰值内存**打进进度行，下次撞墙时一眼看得出是第几个开始涨的。
 - **这台开发机跑不动真实范围的翻牌求解**：内存只有 3GB，而导满三层的产物按
   「节点数 × 组合数」涨——20bb + 双方各 3 个牌类已经 163.7MB，真实范围（几百个组合）
   是 GB 量级。所以 `leak_report.py` 的默认预算很小，且**默认解完就删 dump**；

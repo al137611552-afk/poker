@@ -33,6 +33,7 @@ python3 scripts/leak_report.py --hands 300 --plan-only    # 不求解，只看�
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import random
 import sys
@@ -87,7 +88,19 @@ def make_plans(hands, seat: int, *, accuracy: float, iterations: int):
 
 
 def solve_and_score(plans, solver: TexasSolver, *, timeout: float, keep_cache: bool):
-    """真解并打分。**可利用度要一路带回去**——它决定这份报告可不可信（见 `leaks.py`）。"""
+    """真解并打分。**可利用度要一路带回去**——它决定这份报告可不可信（见 `leaks.py`）。
+
+    ## 每解完一个局面必须立刻把解树扔掉
+
+    `report = solver.solve(...)` 这行**赋值时右侧先求值**：新树建好的那一刻，
+    上一棵还被 `report` 指着——峰值是**两棵**。而一棵真实局面的解树，
+    dump 3.2 GB 解析成 Python 对象就是十几 GB（2026-08-25 Windows 真机实测），
+    两棵就是三十几 GB，32 GB 的机器当场爆。
+
+    所以循环末尾显式 `del` 并强制回收：**峰值从两棵降到一棵**。
+    打分只需要树的一小部分（`ScoredDecision` 里存的是几个字典），
+    树本身用完就没用了，留着纯属占地方。
+    """
     results, exploitability = [], []
     for index, plan in enumerate(plans, start=1):
         started = time.perf_counter()
@@ -104,13 +117,60 @@ def solve_and_score(plans, solver: TexasSolver, *, timeout: float, keep_cache: b
         else:
             gap = report.exploitability
             verdict = f"可利用度 {gap:.3g}%" + ("" if gap <= accuracy else f"（**没收敛到 {accuracy:g}%**）")
+        cached = report.cached
+        elapsed = time.perf_counter() - started
+
+        # **在下一次求解开始之前把这棵树扔掉**，否则峰值是两棵（见上）
+        del report
+        gc.collect()
+
         print(
             f"  [{index}/{len(plans)}] {len(plan.points)} 个决策点，"
-            f"{time.perf_counter() - started:.0f}s，dump {size:.0f}MB"
-            f"{'（已缓存）' if report.cached else ''}，{verdict}",
+            f"{elapsed:.0f}s，dump {size:.0f}MB"
+            f"{'（已缓存）' if cached else ''}，{verdict}"
+            f"{_memory_note()}",
             flush=True,
         )
     return results, exploitability
+
+
+def _memory_note() -> str:
+    """当前进程占了多少内存。**解树是这个脚本唯一的内存大户**，
+    把它打出来，下次再撞内存墙时一眼就能看出是第几个局面开始涨的。
+
+    拿不到就不显示——`resource` 是 POSIX-only，Windows 上没有，
+    而 Windows 恰恰是这个脚本的主力平台。"""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        return f"，峰值 {peak:.1f}GB"
+    except Exception:
+        pass
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [("cb", ctypes.wintypes.DWORD),
+                        ("PageFaultCount", ctypes.wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(counters)
+        ctypes.windll.psapi.GetProcessMemoryInfo(
+            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters),
+            counters.cb)
+        return f"，峰值 {counters.PeakWorkingSetSize / 1e9:.1f}GB"
+    except Exception:
+        return ""
 
 
 def render(report, *, plan_count: int, dealt: int) -> str:
