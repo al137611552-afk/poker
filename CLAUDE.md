@@ -266,3 +266,9 @@ docs/            PRD / ARCHITECTURE / ADR / DEVLOG
 
 开发在 Linux；真机验证在 **Windows + RTX 4060 Ti 8GB**。写代码时避免 POSIX-only 依赖
 与硬编码路径分隔符。8GB 显存是后续接 GPU 求解器时的预算上限，大动作树要能回退到 CPU。
+
+**验证任务书在 `docs/WINDOWS-VERIFY.md`**（写给在那台机器上跑的 agent），
+配套 `scripts/verify_windows.py` 把能自动验的都自动跑了——它把「点开界面看一眼」
+尽量翻译成走 HTTP 接口的断言，只把布局、颜色、触屏手感留给人。
+**每次改完要跟着更新那份文档的「最近一轮的改动」那节**，
+否则下一轮验证会照着过期的重点去做。
